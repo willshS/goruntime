@@ -102,6 +102,7 @@ func makechan(t *chantype, size int) *hchan {
 	2. 不包含指针的时候内存分配为一块
 	3. `chan` 本身内存与环形队列内存分开分配
 3. 数据初始化  
+
 TODO:   
 1. 类型内存对齐为什么要最大是8？ `hchan` 类型大小为8的倍数？
 2. 分配内存包不包含指针不同？ （应与gc有关，后续gc梳理）
@@ -229,6 +230,14 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 关于 `ep` ： go语言是值传递类的语言，因此我们写入通道的数据是被拷贝了一份的：
 ```
 i ：= 1
+// 以下是i变量的声明汇编
+0x00d9 00217 (main.go:19)       LEAQ    type.int(SB), AX
+0x00e0 00224 (main.go:19)       MOVQ    AX, (SP)
+0x00e4 00228 (main.go:19)       CALL    runtime.newobject(SB)
+0x00e9 00233 (main.go:19)       MOVQ    8(SP), AX
+0x00ee 00238 (main.go:19)       MOVQ    AX, "".&i+144(SP)
+0x00f6 00246 (main.go:19)       MOVQ    $1, (AX)
+
 c <- i
 // 以下是对应写入通道c的汇编
 0x0282 00642 (main.go:21)       MOVQ    "".&i+144(SP), AX
