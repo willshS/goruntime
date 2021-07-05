@@ -106,7 +106,7 @@ func makechan(t *chantype, size int) *hchan {
 3. 数据初始化  
 
 TODO:   
-1. 类型内存对齐为什么要最大是8？ `hchan` 类型大小为8的倍数？
+1. 类型内存对齐为什么要最大是8？ `hchan` 类型大小为8的倍数？  
 2. 分配内存包不包含指针不同？ （应与gc有关，后续gc梳理）
 
 ### 2.3 chan的写入
