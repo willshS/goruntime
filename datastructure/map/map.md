@@ -361,6 +361,143 @@ func (h *hmap) newoverflow(t *maptype, b *bmap) *bmap {
 	return ovf
 }
 ```
+从上面可以看到，溢出桶是可能存在两种情况的，一种是我们创建 `map` 的时候参数较大（b>=4,即参数大于4*13），会预分配出一些溢出桶，这些桶会被挂在整个数组的最后。另一种是我们溢出桶用完了或者没有预分配的溢出桶的时候，重新分配一个桶。
+
+--------  
+**tips:从新增就能看出哈希表的整个内存模型了。**
+1. **首先是一整块内存，根据kv类型大小被分为等大的桶。每个桶的大小为：`[8]uint8+8*(keysize+valsize)+uintptr`。**
+2. **桶中的内存模型即8字节的tophash+8个key+8个val+8字节的指向溢出桶的指针**
+3. **当桶中空间不够以及没有预分配溢出桶或预分配的溢出桶被用完，会单独开辟一块内存为一个桶，与主哈希的数组不在一起的内存，通过桶中的尾指针进行关联**
+
+--------  
+
+### 2.3 删
+`map` 删除是调用内置函数 `delete`，经过汇编会调用 `mapdelete` （有兴趣的自己扒汇编，不贴了）：
+```
+func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
+	if raceenabled && h != nil {
+		callerpc := getcallerpc()
+		pc := funcPC(mapdelete)
+		racewritepc(unsafe.Pointer(h), callerpc, pc)
+		raceReadObjectPC(t.key, key, callerpc, pc)
+	}
+	if msanenabled && h != nil {
+		msanread(key, t.key.size)
+	}
+	if h == nil || h.count == 0 {
+	// 可以看到 nil map或空map随便你调用delete 不会panic
+	// 关于这个 issue 有兴趣的也可以看看
+		if t.hashMightPanic() {
+			t.hasher(key, 0) // see issue 23734
+		}
+		return
+	}
+	// 竞争检查
+	if h.flags&hashWriting != 0 {
+		throw("concurrent map writes")
+	}
+
+	// 计算哈希 更改哈希状态
+	hash := t.hasher(key, uintptr(h.hash0))
+	h.flags ^= hashWriting
+	// 找桶
+	bucket := hash & bucketMask(h.B)
+	if h.growing() {
+		growWork(t, h, bucket)
+	}
+	b := (*bmap)(add(h.buckets, bucket*uintptr(t.bucketsize)))
+	bOrig := b
+	top := tophash(hash)
+search:
+	// 与增加不一样，只需要查找桶b以及其溢出桶
+	for ; b != nil; b = b.overflow(t) {
+		for i := uintptr(0); i < bucketCnt; i++ {
+			if b.tophash[i] != top {
+				// 优化,后面没了 不用找了
+				if b.tophash[i] == emptyRest {
+					break search
+				}
+				continue
+			}
+			// top哈希相同的k的位置
+			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
+			k2 := k
+			// 处理key
+			if t.indirectkey() {
+				k2 = *((*unsafe.Pointer)(k2))
+			}
+			// 比较key
+			if !t.key.equal(key, k2) {
+				continue
+			}
+			// 如果是指针，gc来回收，然后只需要处理key中包含的指针
+			if t.indirectkey() {
+				*(*unsafe.Pointer)(k) = nil
+			} else if t.key.ptrdata != 0 {
+				memclrHasPointers(k, t.key.size)
+			}
+			// 处理val
+			e := add(unsafe.Pointer(b), dataOffset+bucketCnt*uintptr(t.keysize)+i*uintptr(t.elemsize))
+			if t.indirectelem() {
+				*(*unsafe.Pointer)(e) = nil
+			} else if t.elem.ptrdata != 0 {
+				memclrHasPointers(e, t.elem.size)
+			} else {
+				memclrNoHeapPointers(e, t.elem.size)
+			}
+
+			// 这里是精髓，我们通过tophash的状态值可以做很多优化，这里当我们删除一个元素，如果这个元素的下一个元素是 emptyRest,那么这个被删除的元素也是emptyRest，否则仅仅是emptyOne
+			b.tophash[i] = emptyOne
+			if i == bucketCnt-1 {
+				if b.overflow(t) != nil && b.overflow(t).tophash[0] != emptyRest {
+					goto notLast
+				}
+			} else {
+				if b.tophash[i+1] != emptyRest {
+					goto notLast
+				}
+			}
+			// 自己的状态搞定了，要往前看，如果前面一个是emptyOne,那么现在也一定是emptyRest了
+			for {
+				b.tophash[i] = emptyRest
+				if i == 0 {
+					// bOrig是主桶，检查b是否是溢出桶
+					if b == bOrig {
+						break // beginning of initial bucket, we're done.
+					}
+					// 溢出桶的话得找到当前桶的前一个溢出桶的最后一个元素
+					c := b
+					for b = bOrig; b.overflow(t) != c; b = b.overflow(t) {
+					}
+					i = bucketCnt - 1
+				} else {
+					// 不管在哪个桶，不是第一个元素，前面就有元素
+					i--
+				}
+				if b.tophash[i] != emptyOne {
+					break
+				}
+			}
+		notLast:
+			h.count--
+			break search
+		}
+	}
+
+	if h.flags&hashWriting == 0 {
+		throw("concurrent map writes")
+	}
+	h.flags &^= hashWriting
+}
+```
+删除函数 `delete` 对于不存在的键和 `nil` 哈希都不会panic  
+通过删除函数，`tophash` 的部分作用就暴漏出来了：
+1. **首先做为比较键的前置，如果 `tophash` 不同，则键一定不同，大大加速了键的比较**
+2. **其次 `tophash` 不存在元素的时候，可以作为所代表的 `cell` 的状态，这个状态也能标识后面 `cell` 的状态，让我们遍历的时候可以不需要遍历所有数据**  
+
+这仅仅是部分作用，其它作用会在后面也凸显出来。
+
+### 2.4 查
 
 ## 3. 总结
 ### 3.1 unsafe.Pointer的骚操作
