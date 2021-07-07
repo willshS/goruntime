@@ -308,7 +308,7 @@ bucketloop:
 		insertk = kmem
 	}
 	if t.indirectelem() {
-		// 跟上面一样 剩下那一句在327行 要照顾上面277行的elem
+		// 跟上面一样 剩下那一句在函数最后，要照顾上面直接goto到done的elem
 		vmem := newobject(t.elem)
 		*(*unsafe.Pointer)(elem) = vmem
 	}
@@ -1004,7 +1004,7 @@ next:
 对于 `uint32`、`uint64`、`string` 类型的键，`go` 单独做了优化。有兴趣的可以自己去翻阅。整个流程与上面 `map` 差别不大，仅仅是做了类型优化。
 
 ### 3.1 unsafe.Pointer的骚操作
-305行的测试代码及其汇编
+"关于大于128字节的key的赋值" 测试代码及其汇编
 ```
 package main
 
@@ -1055,3 +1055,21 @@ func main() {
 0x008c 00140 (main.go:17)	MOVQ	AX, "".uniptr+32(SP)
 ```
 以上最重要的一句就是 `MOVQ	AX, (DI)` ，如果不太懂可以参照 `*jptr = 2` 的汇编赋值那一句 `MOVQ	$2, (AX)`。
+
+### 3.2 iter的小补充
+注：key为一个结构体：
+```
+type test1 struct {
+	a int
+	b string
+}
+```
+我们分析一下2.5.2中的汇编。首先 `hiter` 是一个指针，匿名变量。第一个和第二个参数分别是键和值的指针。在调用 `runtime.mapiterinit(SB)` 返回后，将 `hiter` 8个字节赋值给 `AX`，然后对 `AX` 进行取值操作，前8个字节给 `CX`，第二个8个字节给 `DX`，第三个8个字节给 `AX`。然后将这24个字节分别赋值给变量 `k` 。等下次遍历的时候，我们依然使用的是 `hiter` 的指针，第二次遍历同第一次一样，将数据赋值给变量 `k`。因此每次遍历 `k` 的值是不同的，但是地址是同一个，归根结底都是 `hiter` 的前8个字节的地址，而 `hiter` 是一个栈临时变量，一直没有变动！因此以下用法是错误的：
+```
+// k 和 v 道理一样。
+test := make([]*int, 0, 10)
+for k, v := range m {
+	_ = k
+	test = append(test, &v)
+}
+```
