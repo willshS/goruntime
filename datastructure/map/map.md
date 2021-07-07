@@ -301,7 +301,8 @@ bucketloop:
 	if t.indirectkey() {
 		// 如果存的是指针，new一块key类型的内存，插入位置指向这块内存
 		kmem := newobject(t.key)
-		// insertk 是要插入key的位置的内存地址，也就是说insertk的地址在哈希表的数组里面，不能变，这一句其实就是将kmem的值（指向一个key的地址）放在了insertk的地址上。比如insertk本来是0x60，要在这里放key，它的值现在是初始化状态0x00，kmem是0x80，这一句就是将0x60的值0x00改为0x80。变成了key的二级指针（小补充我们扒汇编！）
+		// insertk 是要插入key的位置的内存地址，也就是说insertk的地址在哈希表的数组里面，不能变，这一句其实就是将kmem的值（指向一个key的地址）放在了insertk的地址上。
+		// 比如insertk本来是0x60，要在这里放key，它的值现在是初始化状态0x00，kmem是0x80，这一句就是将0x60的值0x00改为0x80。变成了key的二级指针（小补充我们扒汇编！）
 		*(*unsafe.Pointer)(insertk) = kmem
 		// 让insertk真正的指向要放key的指针
 		insertk = kmem
@@ -447,7 +448,8 @@ search:
 				memclrNoHeapPointers(e, t.elem.size)
 			}
 
-			// 这里是精髓，我们通过tophash的状态值可以做很多优化，这里当我们删除一个元素，如果这个元素的下一个元素是 emptyRest,那么这个被删除的元素也是emptyRest，否则仅仅是emptyOne
+			// 这里是精髓，我们通过tophash的状态值可以做很多优化。
+			// 这里当我们删除一个元素，如果这个元素的下一个元素是 emptyRest,那么这个被删除的元素也是emptyRest，否则仅仅是emptyOne
 			b.tophash[i] = emptyOne
 			if i == bucketCnt-1 {
 				if b.overflow(t) != nil && b.overflow(t).tophash[0] != emptyRest {
@@ -546,7 +548,8 @@ func hashGrow(t *maptype, h *hmap) {
 上面的函数的功能是生成新的桶数组，并且修改哈希表的相关数据状态。真正的扩容工作，是在增和删的函数中做的。加入我们要新增或者删除某个桶的数据，那么先对这个桶做rehash。因此保证了增和删操作都是在新的桶数组上进行！
 ```
 func growWork(t *maptype, h *hmap, bucket uintptr) {
-	// 这个函数扩容，参数bucket是新的数组的桶号，根据这个桶号算出在旧的桶数组中的桶号（因为是二倍扩容，比如以前10个桶，扩容到20，那么以前5号桶的数据就分散到了现在的5号桶和15号桶）
+	// 这个函数扩容，参数bucket是新的数组的桶号，根据这个桶号算出在旧的桶数组中的桶号
+	//（因为是二倍扩容，比如以前10个桶，扩容到20，那么以前5号桶的数据就分散到了现在的5号桶和15号桶）
 	evacuate(t, h, bucket&h.oldbucketmask())
 
 	// evacuate one more oldbucket to make progress on growing
@@ -791,7 +794,7 @@ type hiter struct {
 ```
 // k,v := range m
 0x013f 00319 (main.go:14)	MOVQ	"".m+96(SP), AX
-0x0144 00324 (main.go:14)	MOVQ	AX, ""..autotmp_11+144(SP)			// m是我们的map 拷贝一个（map本身就是8字节的指针）
+0x0144 00324 (main.go:14)	MOVQ	AX, ""..autotmp_11+144(SP) // m是我们的map 拷贝一个（map本身就是8字节的指针）
 0x014c 00332 (main.go:14)	LEAQ	""..autotmp_12+416(SP), DI
 0x0154 00340 (main.go:14)	XORPS	X0, X0
 0x0157 00343 (main.go:14)	PCDATA	$0, $-2
@@ -799,12 +802,12 @@ type hiter struct {
 0x015b 00347 (main.go:14)	NOP
 0x0160 00352 (main.go:14)	DUFFZERO	$273
 0x0173 00371 (main.go:14)	PCDATA	$0, $-1
-0x0173 00371 (main.go:14)	MOVQ	""..autotmp_11+144(SP), AX			// map放到 AX
-0x017b 00379 (main.go:14)	LEAQ	type.map["".test1]int(SB), CX		// map类型放到CX
-0x0182 00386 (main.go:14)	MOVQ	CX, (SP)												// 类型入栈
-0x0186 00390 (main.go:14)	MOVQ	AX, 8(SP)												// m指针入栈
+0x0173 00371 (main.go:14)	MOVQ	""..autotmp_11+144(SP), AX // map放到 AX
+0x017b 00379 (main.go:14)	LEAQ	type.map["".test1]int(SB), CX // map类型放到CX
+0x0182 00386 (main.go:14)	MOVQ	CX, (SP) // 类型入栈
+0x0186 00390 (main.go:14)	MOVQ	AX, 8(SP) // m指针入栈
 0x018b 00395 (main.go:14)	LEAQ	""..autotmp_12+416(SP), AX
-0x0193 00403 (main.go:14)	MOVQ	AX, 16(SP)											// 根据参数顺序，匿名变量12 就是 *hiter了，这说明hiter是栈变量
+0x0193 00403 (main.go:14)	MOVQ	AX, 16(SP) // 根据参数顺序，匿名变量12 就是 *hiter了，这说明hiter是栈变量
 0x0198 00408 (main.go:14)	PCDATA	$1, $3
 0x0198 00408 (main.go:14)	CALL	runtime.mapiterinit(SB)
 0x019d 00413 (main.go:14)	JMP	415
@@ -823,7 +826,9 @@ type hiter struct {
 0x01e4 00484 (main.go:14)	TESTB	AL, (AX)
 0x01e6 00486 (main.go:14)	MOVQ	(AX), AX
 0x01e9 00489 (main.go:14)	MOVQ	AX, "".v+64(SP)
+```
 
+```
 func mapiterinit(t *maptype, h *hmap, it *hiter) {
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
@@ -995,7 +1000,8 @@ next:
 4. 更新迭代器的当前遍历的桶号 `hiter.bucket` 和 `hiter.checkBucket`，以便下次迭代时可以继续进行，所以如果继续遍历此桶，状态未变，知道这个桶遍历完，继续第2步。
 
 ## 3. 总结
-`map` 的实现其实以遍历最难，要考虑到太多种情况，非常难以理解。源码中的 `tophash`、`flags`、`overflow` 等字段都使用的非常巧妙，极大地提升了效率。`mapextra` 的设计来管理所有溢出桶可以让不包含指针类型并且大小小于128的哈希主数组避免被整个扫描。
+`map` 的实现其实以遍历最难，要考虑到太多种情况，非常难以理解。源码中的 `tophash`、`flags`、`overflow` 等字段都使用的非常巧妙，极大地提升了效率。`mapextra` 的设计来管理所有溢出桶可以让不包含指针类型并且大小小于128的哈希主数组避免被整个扫描。  
+对于 `uint32`、`uint64`、`string` 类型的键，`go` 单独做了优化。有兴趣的可以自己去翻阅。整个流程与上面 `map` 差别不大，仅仅是做了类型优化。
 
 ### 3.1 unsafe.Pointer的骚操作
 305行的测试代码及其汇编
@@ -1020,29 +1026,29 @@ func main() {
 }
 
 // 汇编
-0x0021 00033 (main.go:8)	MOVQ	$1, "".i+16(SP)					// 给i赋值1
-0x002a 00042 (main.go:9)	LEAQ	"".i+16(SP), AX					// i的地址给ax
-0x002f 00047 (main.go:9)	MOVQ	AX, "".iptr+48(SP)			// ax的值给iptr
-0x0034 00052 (main.go:10)	MOVQ	AX, "".uniptr+32(SP)		// iptr与uniptr一模一样
+0x0021 00033 (main.go:8)	MOVQ	$1, "".i+16(SP)	// 给i赋值1
+0x002a 00042 (main.go:9)	LEAQ	"".i+16(SP), AX	// i的地址给ax
+0x002f 00047 (main.go:9)	MOVQ	AX, "".iptr+48(SP) // ax的值给iptr
+0x0034 00052 (main.go:10)	MOVQ	AX, "".uniptr+32(SP) // iptr与uniptr一模一样
 0x0039 00057 (main.go:12)	LEAQ	type.int(SB), AX
 0x0040 00064 (main.go:12)	MOVQ	AX, (SP)
 0x0044 00068 (main.go:12)	PCDATA	$1, $1
-0x0044 00068 (main.go:12)	CALL	runtime.newobject(SB)		//jptr
+0x0044 00068 (main.go:12)	CALL	runtime.newobject(SB) //jptr
 0x0049 00073 (main.go:12)	MOVQ	8(SP), AX
 0x004e 00078 (main.go:12)	MOVQ	AX, "".jptr+40(SP)
-0x0053 00083 (main.go:13)	MOVQ	$2, (AX)								//给 jptr 赋值
+0x0053 00083 (main.go:13)	MOVQ	$2, (AX) //给 jptr 赋值
 0x005a 00090 (main.go:14)	MOVQ	"".jptr+40(SP), AX
 0x005f 00095 (main.go:14)	MOVQ	AX, "".unjptr+24(SP)
-0x0064 00100 (main.go:16)	MOVQ	"".uniptr+32(SP), DI			// 将uniptr的值给DI
+0x0064 00100 (main.go:16)	MOVQ	"".uniptr+32(SP), DI // 将uniptr的值给DI
 0x0069 00105 (main.go:16)	MOVQ	DI, ""..autotmp_5+56(SP)
 0x006e 00110 (main.go:16)	TESTB	AL, (DI)
-0x0070 00112 (main.go:16)	MOVQ	"".unjptr+24(SP), AX			// unjptr的值给AX
+0x0070 00112 (main.go:16)	MOVQ	"".unjptr+24(SP), AX // unjptr的值给AX
 0x0075 00117 (main.go:16)	PCDATA	$0, $-2
 0x0075 00117 (main.go:16)	CMPL	runtime.writeBarrier(SB), $0
 0x007c 00124 (main.go:16)	JEQ	130
 0x007e 00126 (main.go:16)	NOP
 0x0080 00128 (main.go:16)	JMP	155
-0x0082 00130 (main.go:16)	MOVQ	AX, (DI)                  // DI 中的值指向AX的值
+0x0082 00130 (main.go:16)	MOVQ	AX, (DI) // DI 中的值指向AX的值
 0x0085 00133 (main.go:16)	JMP	135
 0x0087 00135 (main.go:17)	PCDATA	$0, $-1
 0x0087 00135 (main.go:17)	MOVQ	"".unjptr+24(SP), AX
