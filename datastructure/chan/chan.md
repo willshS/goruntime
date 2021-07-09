@@ -212,6 +212,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	gp.waiting = nil
 	gp.activeStackChans = false
 	// 这里有个假的唤醒， 关闭的时候可以看到
+	// 这是go1.15代码 1.16已经不用param来判断了
 	if gp.param == nil {
 		if c.closed == 0 {
 			throw("chansend: spurious wakeup")
