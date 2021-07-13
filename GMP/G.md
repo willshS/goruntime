@@ -19,7 +19,7 @@ type g struct {
   atomicstatus uint32
 	// G的唯一标识
 	goid         int64
-	schedlink    guintptr
+	schedlink    guintptr	// 调度链表
   // block相关
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting
@@ -96,7 +96,7 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
   // 初始化程序计数器为goexit
 	newg.sched.pc = funcPC(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
 	newg.sched.g = guintptr(unsafe.Pointer(newg))
-  // sched.sp = sched.pc && sched.pc = fn
+  // 这里继续初始化：sched.sp = sched.pc && sched.pc = fn
 	gostartcallfn(&newg.sched, fn)
 	newg.gopc = callerpc
 	newg.startpc = fn.fn

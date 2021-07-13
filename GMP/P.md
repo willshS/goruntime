@@ -1,5 +1,5 @@
 # P
-`P` 被成为调度器。
+`P` 被称为处理器。
 
 ## P的主要字段
 ```
@@ -7,7 +7,7 @@ type p struct {
 	id          int32
 	status      uint32 // P的状态
 	link        puintptr // 链表指针指向下一个P
-	schedtick   uint32     // incremented on every scheduler call
+	schedtick   uint32     // 每次调度++
 	syscalltick uint32     // incremented on every system call
 	sysmontick  sysmontick // last tick observed by sysmon
 	m           muintptr   // P绑定的M
@@ -23,9 +23,9 @@ type p struct {
 	goidcacheend uint64
 
 	// 可运行的goroutine列表
-	runqhead uint32
-	runqtail uint32
-	runq     [256]guintptr
+	runqhead uint32  // 头的下标
+	runqtail uint32  // 尾的下标
+	runq     [256]guintptr // 本地G环形队列
 
   // 下一个要运行的G，可能为空。继承当前G剩下的时间片如果还有剩余的话。
 	runnext guintptr

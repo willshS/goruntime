@@ -23,7 +23,6 @@ type m struct {
 	preemptoff    string // if != "", keep curg running on this m
 	locks         int32  // 锁 禁止抢占？
 
-
 	spinning      bool // m 自旋
 	blocked       bool // m is blocked on a note
 	newSigstack   bool // minit on C thread called sigaltstack
