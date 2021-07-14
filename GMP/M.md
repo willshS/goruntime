@@ -41,10 +41,9 @@ type m struct {
 	lockedExt     uint32      // tracking for external LockOSThread
 	lockedInt     uint32      // tracking for internal lockOSThread
 	nextwaitm     muintptr    // next m waiting for lock
-	waitunlockf   func(*g, unsafe.Pointer) bool
-	waitlock      unsafe.Pointer
-	waittraceev   byte
-	waittraceskip int
+	waitunlockf   func(*g, unsafe.Pointer) bool	// 挂起当前的G要执行的函数 可以为nil
+	waitlock      unsafe.Pointer  // 上面函数的第二个参数
+
 	startingtrace bool
 	syscalltick   uint32
 	freelink      *m // on sched.freem

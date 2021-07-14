@@ -662,3 +662,102 @@ func goexit0(gp *g) {
 }
 ```
 协程执行结束，主要是各种状态的重置，以及继续调度。
+
+## 4. 其它触发调度的方式
+调度完全通过函数 `schedule()` 来进行，除了上面介绍的类似于线程池线程开始和任务执行结束开始调度外，我们只需要看看哪里调用了调度函数就知道还有什么地方会进行调度
+
+### 4.1 协程主动挂起导致的调度
+当协程等待某些资源的时候可以进行主动挂起，有其它协程满足资源时需要被唤醒
+
+#### 4.1.1 主动挂起
+我们知道协程写入通道的时候，如果通道已满（包括无缓冲通道）或 通道为 `nil`，则协程会阻塞，参考[chan源码解析](../datastruct/chan/chan.md)。此时需要阻塞的协程调用 `gopark` 函数进入阻塞等待：
+```
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason waitReason, traceEv byte, traceskip int) {
+	mp := acquirem()
+	gp := mp.curg
+	status := readgstatus(gp)
+	if status != _Grunning && status != _Gscanrunning {
+		throw("gopark: bad g status")
+	}
+	// m挂起G相关变量
+	mp.waitlock = lock
+	mp.waitunlockf = unlockf
+	gp.waitreason = reason
+
+	releasem(mp)
+	// can't do anything that might move the G between Ms here.
+	mcall(park_m)
+}
+
+func park_m(gp *g) {
+	_g_ := getg()
+	// 修改要挂起的G的状态为等待
+	casgstatus(gp, _Grunning, _Gwaiting)
+	// 与M的curg解除
+	dropg()
+	// 调用挂起G 传入的函数 （函数和参数都是要挂起的G传入的）
+	if fn := _g_.m.waitunlockf; fn != nil {
+		ok := fn(gp, _g_.m.waitlock)
+		_g_.m.waitunlockf = nil
+		_g_.m.waitlock = nil
+		if !ok {
+			// 返回false 可以重新运行
+			casgstatus(gp, _Gwaiting, _Grunnable)
+			execute(gp, true) // Schedule it back, never returns.
+		}
+	}
+	// 重新调度
+	schedule()
+}
+```
+通过 `waitunlockf` 函数，可以很轻松的对不同业务做处理，比如 `chansend` 阻塞到已满缓冲区的 `chan` 时，此时要读取数据，所以已经对 `chan` 进行了加锁操作，那么可以在 `waitunlockf` 函数中进行解锁操作，不影响其它对这个 `chan` 操作的协程。而且可以根据 `waitunlockf` 函数的返回值来确定是否要真的挂起重新调度。
+
+#### 4.1.2 唤醒
+协程主动挂起后，状态为 `_Gwaiting`，此状态表示协程为阻塞状态。等待条件触发时，需要调用 `goready` 来进行唤醒，核心函数为 `ready` 函数：
+```
+// Mark gp ready to run.
+func ready(gp *g, traceskip int, next bool) {
+	status := readgstatus(gp)
+
+	// Mark runnable.
+	_g_ := getg()
+	mp := acquirem() // disable preemption because it can be holding p in a local var
+	if status&^_Gscan != _Gwaiting {
+		dumpgstatus(gp)
+		throw("bad g->status in ready")
+	}
+
+	// 修改协程状态 并放入本地队列
+	casgstatus(gp, _Gwaiting, _Grunnable)
+	runqput(_g_.m.p.ptr(), gp, next)
+	wakep()
+	releasem(mp)
+}
+```
+
+### 4.2 协程主动让出CPU
+调用 `Gosched` 函数可以让当前协程让出CPU，但是不进行挂起。 `Gosched` 的核心非常简单：
+```
+func goschedImpl(gp *g) {
+	status := readgstatus(gp)
+	if status&^_Gscan != _Grunning {
+		dumpgstatus(gp)
+		throw("bad g status")
+	}
+	// 修改状态为可运行
+	casgstatus(gp, _Grunning, _Grunnable)
+	// 解绑curg
+	dropg()
+	lock(&sched.lock)
+	// 放入全局可运行队列
+	globrunqput(gp)
+	unlock(&sched.lock)
+	// 调度
+	schedule()
+}
+```
+需要注意的是，协程被放入了全局可运行队列等待被调度，而非本地的可运行队列。  
+还有一个与 `Gosched` 类似的函数 `goyield`，两个函数基本相同，只不过后者将协程放入了本地的可运行队列。这里就不贴代码了。
+
+### 4.3 系统调用调度
+### 4.4 抢占调度
