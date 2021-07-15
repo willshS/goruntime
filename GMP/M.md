@@ -48,13 +48,6 @@ type m struct {
 	syscalltick   uint32
 	freelink      *m // on sched.freem
 
-	// mFixup is used to synchronize OS related m state (credentials etc)
-	// use mutex to access.
-	mFixup struct {
-		lock mutex
-		fn   func(bool) bool
-	}
-
 	// these are here because they are too large to be on the stack
 	// of low-level NOSPLIT functions.
 	libcall   libcall

@@ -294,6 +294,7 @@ func execute(gp *g, inheritTime bool) {
 	// 修改G的状态为运行中
 	casgstatus(gp, _Grunnable, _Grunning)
 	gp.waitsince = 0
+	// 重置g的调度状态
 	gp.preempt = false
 	gp.stackguard0 = gp.stack.lo + _StackGuard
 	if !inheritTime {
@@ -544,6 +545,7 @@ top:
 			// 检查P2的状态，空闲的话就不要去偷了，它肯定没东西
 			if !idlepMask.read(enum.position()) {
 				// 偷：这个函数就是检查p2的可执行协程队列，然后偷前1/2过来（必须小于p2本地队列的一半）。
+				// 偷并不需要加锁，类似于环形无锁队列，先抓取快照，然后计算拷贝要偷的任务，之后cas确定没有竞争。
 				if gp := runqsteal(_p_, p2, stealTimersOrRunNextG); gp != nil {
 					return gp, false
 				}
@@ -663,6 +665,95 @@ func goexit0(gp *g) {
 ```
 协程执行结束，主要是各种状态的重置，以及继续调度。
 
+### 3.4 sysmon监控
+`runtime.main` 中我们启动了 `sysmon`，此函数为监控函数：
+```
+func sysmon() {
+	lock(&sched.lock)
+	sched.nmsys++
+	checkdead()
+	unlock(&sched.lock)
+
+	atomic.Store(&sched.sysmonStarting, 0)
+
+	lasttrace := int64(0)
+	idle := 0 // how many cycles in succession we had not wokeup somebody
+	delay := uint32(0)
+
+	for {
+		if idle == 0 { // start with 20us sleep...
+			delay = 20
+		} else if idle > 50 { // start doubling the sleep after 1ms...
+			delay *= 2
+		}
+		if delay > 10*1000 { // up to 10ms
+			delay = 10 * 1000
+		}
+		// 休眠一会
+		usleep(delay)
+		mDoFixup()
+
+		now := nanotime()
+		if debug.schedtrace <= 0 && (sched.gcwaiting != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs)) {
+			lock(&sched.lock)
+			// 如果正在gc，或者所有P都是空闲的
+			if atomic.Load(&sched.gcwaiting) != 0 || atomic.Load(&sched.npidle) == uint32(gomaxprocs) {
+				syscallWake := false
+				// 检查所有P的timer
+				next, _ := timeSleepUntil()
+				if next > now {
+					// 修改sysmon的状态
+					atomic.Store(&sched.sysmonwait, 1)
+					unlock(&sched.lock)
+					// 睡眠时间计算
+					sleep := forcegcperiod / 2
+					if next-now < sleep {
+						sleep = next - now
+					}
+					// 系统调用 futex 休眠
+					syscallWake = notetsleep(&sched.sysmonnote, sleep)
+					mDoFixup()
+					lock(&sched.lock)
+					// 休眠结束 状态改回来
+					atomic.Store(&sched.sysmonwait, 0)
+					noteclear(&sched.sysmonnote)
+				}
+				// 这里表示被唤醒了 还是休眠时间到了
+				if syscallWake {
+					idle = 0
+					delay = 20
+				}
+			}
+			unlock(&sched.lock)
+		}
+
+		lock(&sched.sysmonlock)
+		now = nanotime()
+
+		// 调用网络轮询器
+		lastpoll := int64(atomic.Load64(&sched.lastpoll))
+		if netpollinited() && lastpoll != 0 && lastpoll+10*1000*1000 < now {
+			atomic.Cas64(&sched.lastpoll, uint64(lastpoll), uint64(now))
+			list := netpoll(0) // non-blocking - returns list of goroutines
+			if !list.empty() {
+				// 对于触发网络事件的协程，放入可运行队列 （sysmon运行没有P，这里放入全局可运行队列）
+				incidlelocked(-1)
+				injectglist(&list)
+				incidlelocked(1)
+			}
+		}
+		mDoFixup()
+		// 检查所有P的状态
+		if retake(now) != 0 {
+			idle = 0
+		} else {
+			idle++
+		}
+		unlock(&sched.sysmonlock)
+	}
+}
+```
+
 ## 4. 其它触发调度的方式
 调度完全通过函数 `schedule()` 来进行，除了上面介绍的类似于线程池线程开始和任务执行结束开始调度外，我们只需要看看哪里调用了调度函数就知道还有什么地方会进行调度
 
@@ -760,4 +851,435 @@ func goschedImpl(gp *g) {
 还有一个与 `Gosched` 类似的函数 `goyield`，两个函数基本相同，只不过后者将协程放入了本地的可运行队列。这里就不贴代码了。
 
 ### 4.3 系统调用调度
+#### 4.3.1 进入系统调用
+在调用系统函数时，汇编实现的 `syscall` 会先调用 `entersyscall`，表示进入系统调用：
+```
+func reentersyscall(pc, sp uintptr) {
+	_g_ := getg()
+	_g_.m.locks++
+	// g的状态改为可抢占
+	_g_.stackguard0 = stackPreempt
+	_g_.throwsplit = true
+
+	// 保存调用系统函数的调用者的pc和sp
+	save(pc, sp)
+	_g_.syscallsp = sp
+	_g_.syscallpc = pc
+	// 修改G的状态为系统调用
+	casgstatus(_g_, _Grunning, _Gsyscall)
+
+	if atomic.Load(&sched.sysmonwait) != 0 {
+		// 如果sysmon此时在休眠，把它唤醒
+		systemstack(entersyscall_sysmon)
+		save(pc, sp)
+	}
+	// m的系统调用次数 = p的系统调用次数
+	_g_.m.syscalltick = _g_.m.p.ptr().syscalltick
+	_g_.sysblocktraced = true
+	// 把P 给M 的oldp 藕断丝连的解绑
+	pp := _g_.m.p.ptr()
+	pp.m = 0
+	_g_.m.oldp.set(pp)
+	_g_.m.p = 0
+	// P状态改为系统调用
+	atomic.Store(&pp.status, _Psyscall)
+	if sched.gcwaiting != 0 {
+		// 如果GC正在等的操作
+		systemstack(entersyscall_gcwait)
+		save(pc, sp)
+	}
+
+	_g_.m.locks--
+}
+```
+一个协程进入系统调用，我们并没有直接将 `P` 与 `M` 直接解绑，而是半解绑的状态。还有一个系统调用前调用的函数为 `entersyscallblock` ，它与上面函数类似，只是在确定此系统调用会阻塞一段时间的时候使用（如：`sleep`）：
+```
+func entersyscallblock() {
+	...... // 与上面函数类似
+	// 关键在于此函数
+	systemstack(entersyscallblock_handoff)
+	// entersyscallblock_handoff 主要调用了 handoffp(releasep())
+}
+```
+`entersyscallblock_handoff` 函数中调用 `releasep` 将M与P彻底解绑（不存在oldp），并调用 `handoffp` 移交P。
+
+#### 4.3.2 P的状态检查
+监控线程 `sysmon` 中会调用以下函数来监控所有 `P` :
+```
+func retake(now int64) uint32 {
+	n := 0
+	lock(&allpLock)
+	for i := 0; i < len(allp); i++ {
+		_p_ := allp[i]
+		if _p_ == nil {
+			continue
+		}
+		pd := &_p_.sysmontick
+		s := _p_.status
+		sysretake := false
+		if s == _Prunning || s == _Psyscall {
+			// 首先记录P的调度次数到P的监控次数中
+			t := int64(_p_.schedtick)
+			if int64(pd.schedtick) != t {
+				pd.schedtick = uint32(t)
+				pd.schedwhen = now
+			} else if pd.schedwhen+forcePreemptNS <= now {
+				// 若P的监控次数与调度次数一致，并且过去了10ms，说明P已经10ms没有进行调度，一直执行了，抢占
+				preemptone(_p_)
+				sysretake = true
+			}
+		}
+		if s == _Psyscall {
+			// 如果是系统调用，同上，记录P的调度次数到P的监控次数中
+			t := int64(_p_.syscalltick)
+			if !sysretake && int64(pd.syscalltick) != t {
+				pd.syscalltick = uint32(t)
+				pd.syscallwhen = now
+				continue
+			}
+			// 如果没有工作要做了，并且有其它M在自旋或空闲的P，并且在10ms以内
+			if runqempty(_p_) && atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) > 0 && pd.syscallwhen+10*1000*1000 > now {
+				continue
+			}
+			unlock(&allpLock)
+			// 防止死锁检测
+			incidlelocked(-1)
+			// 修改P的状态
+			if atomic.Cas(&_p_.status, s, _Pidle) {
+				n++
+				_p_.syscalltick++
+				// 移交P
+				handoffp(_p_)
+			}
+			// 恢复
+			incidlelocked(1)
+			lock(&allpLock)
+		}
+	}
+	unlock(&allpLock)
+	return uint32(n)
+}
+```
+
+#### 4.3.3 P的移交
+当系统调用进入阻塞，那么根据可运行队列的情况、网络轮询情况和线程休眠情况来判断这个 `P` 进入休息还是新建 `M` 继续执行任务
+```
+func handoffp(_p_ *p) {
+	// P中还有协程等待执行，startm新建一个m与p绑定继续调度执行
+	if !runqempty(_p_) || sched.runqsize != 0 {
+		startm(_p_, false)
+		return
+	}
+
+	// 如果没有工作要做，并且此时没有自旋M，启动一个M自旋找工作
+	if atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) == 0 && atomic.Cas(&sched.nmspinning, 0, 1) { // TODO: fast atomic
+		startm(_p_, true)
+		return
+	}
+	lock(&sched.lock)
+	// 全局队列中有等待运行的G，新建M绑定这个P
+	if sched.runqsize != 0 {
+		unlock(&sched.lock)
+		startm(_p_, false)
+		return
+	}
+	// 其它P都在休息，并且没人网络轮询，新建M
+	if sched.npidle == uint32(gomaxprocs-1) && atomic.Load64(&sched.lastpoll) != 0 {
+		unlock(&sched.lock)
+		startm(_p_, false)
+		return
+	}
+
+	when := nobarrierWakeTime(_p_)
+	// P放入空闲队列
+	pidleput(_p_)
+	unlock(&sched.lock)
+	// 如果需要网络轮询，唤醒
+	if when != 0 {
+		wakeNetPoller(when)
+	}
+}
+```
+
+#### 4.3.4 退出系统调用
+结束系统调用会调用以下函数：
+```
+func exitsyscall() {
+	_g_ := getg()
+
+	_g_.m.locks++ // see comment in entersyscall
+	if getcallersp() > _g_.syscallsp {
+		throw("exitsyscall: syscall frame is no longer valid")
+	}
+
+	_g_.waitsince = 0
+	oldp := _g_.m.oldp.ptr()
+	_g_.m.oldp = 0
+	// 快速路径 这里是M重新与oldp绑定或者成功获取一个空闲的P
+	if exitsyscallfast(oldp) {
+		_g_.m.p.ptr().syscalltick++
+		// 修改状态
+		casgstatus(_g_, _Gsyscall, _Grunning)
+
+		if sched.disable.user && !schedEnabled(_g_) {
+			// 主动让出cpu
+			Gosched()
+		}
+		return
+	}
+
+	_g_.sysexitticks = 0
+
+	_g_.m.locks--
+
+	// 慢速路径，
+	mcall(exitsyscall0)
+	_g_.syscallsp = 0
+	_g_.m.p.ptr().syscalltick++
+	_g_.throwsplit = false
+}
+// 慢速路径退出系统调用
+func exitsyscall0(gp *g) {
+	_g_ := getg()
+	// 修改G状态为可运行
+	casgstatus(gp, _Gsyscall, _Grunnable)
+	// 与M解绑
+	dropg()
+	lock(&sched.lock)
+	var _p_ *p
+	if schedEnabled(_g_) {
+		// 再次尝试获取P
+		_p_ = pidleget()
+	}
+	if _p_ == nil {
+		// 没有P 放入全局队列
+		globrunqput(gp)
+	} else if atomic.Load(&sched.sysmonwait) != 0 {
+		atomic.Store(&sched.sysmonwait, 0)
+		notewakeup(&sched.sysmonnote)
+	}
+	unlock(&sched.lock)
+	if _p_ != nil {
+		// 绑定P 继续执行
+		acquirep(_p_)
+		// 这里永不返回，调用execute运行之后，无论是被抢占(走信号抢占调度)还是执行完毕(走goexit0调度)都不会返回
+		execute(gp, false) // Never returns.
+	}
+	if _g_.m.lockedg != 0 {
+		// 有锁的g，等待运行
+		stoplockedm()
+		// 同上
+		execute(gp, false) // Never returns.
+	}
+	// 这里是没找到P 停止M
+	stopm()
+	// 上面停止M 被唤醒说明有工作了，这里继续调度
+	schedule() // Never returns.
+}
+```
+
 ### 4.4 抢占调度
+刚开始的 `go` 的抢占调度是协作式调度，1.14版本后的抢占调度加入了基于信号的抢占。在 `retake` 函数中，如果满足抢占条件，会调用下面的抢占函数：
+```
+func preemptone(_p_ *p) bool {
+	mp := _p_.m.ptr()
+	if mp == nil || mp == getg().m {
+		return false
+	}
+	gp := mp.curg
+	if gp == nil || gp == mp.g0 {
+		return false
+	}
+
+	gp.preempt = true
+	gp.stackguard0 = stackPreempt
+
+	// 发送抢占信号给需要抢占的线程
+	if preemptMSupported && debug.asyncpreemptoff == 0 {
+		_p_.preempt = true
+		preemptM(mp)
+	}
+
+	return true
+}
+```
+`preemptM` 发送抢占信号，内部是调用操作系统的 `tgkill` 发送抢占信号到对应的线程。
+
+#### 4.4.1 基于协作的抢占调度
+协作抢占的核心在于编译器会对函数调用前插入 `morestack`，函数调用时会在 `newstack` 中检查是否被抢占，如果被抢占则主动让出cpu。这个过程完全是基于被强占的线程主动发现自己被强占，主动去让出cpu，而且必须基于函数调用才有可能主动发现。
+```
+func newstack() {
+	thisg := getg()
+	gp := thisg.m.curg
+
+	// 获取抢占状态
+	preempt := atomic.Loaduintptr(&gp.stackguard0) == stackPreempt
+
+	if preempt {
+		// 无法被强占
+		if !canPreemptM(thisg.m) {
+			// 继续运行
+			gp.stackguard0 = gp.stack.lo + _StackGuard
+			gogo(&gp.sched) // never return
+		}
+	}
+
+	if preempt {
+		if gp == thisg.m.g0 {
+			// g0 不能被抢占
+			throw("runtime: preempt g0")
+		}
+		if thisg.m.p == 0 && thisg.m.locks == 0 {
+			throw("runtime: g is running but p is not")
+		}
+
+		if gp.preemptShrink {
+			// 栈收缩
+			gp.preemptShrink = false
+			shrinkstack(gp)
+		}
+
+		if gp.preemptStop {
+			// 抢占函数
+			preemptPark(gp) // never returns
+		}
+
+		// 抢占函数
+		gopreempt_m(gp) // never return
+	}
+}
+```
+`gopreempt_m` 函数调用的就是 4.2 介绍的 `goschedImpl` 函数来将当前 `g` 放入全局可运行队列，并重新进行调度。
+#### 4.4.2 基于信号的抢占调度
+信号调度的核心在于信号的处理，程序启动时会调用 `initsig` 注册所有信号，对每种信号调用 `setsig` 进行注册处理函数为汇编函数 `sigtramp` ：
+```
+func setsig(i uint32, fn uintptr) {
+	var sa sigactiont
+	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTORER | _SA_RESTART
+	sigfillset(&sa.sa_mask)
+	if GOARCH == "386" || GOARCH == "amd64" {
+		sa.sa_restorer = funcPC(sigreturn)
+	}
+	if fn == funcPC(sighandler) {
+		if iscgo {
+			fn = funcPC(cgoSigtramp)
+		} else {
+			// 非cgo的信号处理函数
+			fn = funcPC(sigtramp)
+		}
+	}
+	sa.sa_handler = fn
+	// 系统调用注册信号
+	sigaction(i, &sa, nil)
+}
+```
+最终信号处理函数依然是 `sighandler` 来处理信号。
+```
+func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
+	_g_ := getg()
+	c := &sigctxt{info, ctxt}
+	if sig == sigPreempt && debug.asyncpreemptoff == 0 {
+		// 处理抢占信号
+		doSigPreempt(gp, c)
+	}
+}
+
+func doSigPreempt(gp *g, ctxt *sigctxt) {
+	// (gp.preempt || gp.m.p != 0 && gp.m.p.ptr().preempt) && readgstatus(gp)&^_Gscan == _Grunning
+	// 检查g的信号状态，g的运行状态
+	if wantAsyncPreempt(gp) {
+		if ok, newpc := isAsyncSafePoint(gp, ctxt.sigpc(), ctxt.sigsp(), ctxt.siglr()); ok {
+			// 修改运行上下文，使用asyncPreempt处理信号
+			ctxt.pushCall(funcPC(asyncPreempt), newpc)
+		}
+	}
+	// 增加信号处理次数
+	atomic.Xadd(&gp.m.preemptGen, 1)
+	// 修改m为没有信号
+	atomic.Store(&gp.m.signalPending, 0)
+
+	if GOOS == "darwin" || GOOS == "ios" {
+		atomic.Xadd(&pendingPreemptSignals, -1)
+	}
+}
+```
+`asyncPreempt` 函数调用以下函数来处理抢占信号：
+```
+func asyncPreempt2() {
+	gp := getg()
+	gp.asyncSafePoint = true
+	if gp.preemptStop {
+		mcall(preemptPark)
+	} else {
+		mcall(gopreempt_m)
+	}
+	gp.asyncSafePoint = false
+}
+```
+可以看到抢占信号的处理与 `newstack` 中的对抢占的处理是一样的。
+```
+func preemptPark(gp *g) {
+	if trace.enabled {
+		traceGoPark(traceEvGoBlock, 0)
+	}
+	status := readgstatus(gp)
+	if status&^_Gscan != _Grunning {
+		dumpgstatus(gp)
+		throw("bad g status")
+	}
+	gp.waitreason = waitReasonPreempted
+	// 这里最终G的状态为_Gpreempted。
+	casGToPreemptScan(gp, _Grunning, _Gscan|_Gpreempted)
+	dropg()
+	casfrom_Gscanstatus(gp, _Gscan|_Gpreempted, _Gpreempted)
+	// 调度
+	schedule()
+}
+```
+这里解释一下 `preemptStop` ，信号抢占调度提供了 `suspendG` 函数来挂起一个线程，此函数会 `preemptStop = true` ，如果是被其它线程挂起了被抢占的线程，那么被强占线程中的 `G` 的状态为 `_Gpreempted`。而调用 `suspendG` 的线程会在此函数中进行状态管理：
+```
+func suspendG(gp *g) suspendGState {
+ if mp := getg().m; mp.curg != nil && readgstatus(mp.curg) == _Grunning {
+	 throw("suspendG from non-preemptible goroutine")
+ }
+
+ const yieldDelay = 10 * 1000
+ var nextYield int64
+
+ stopped := false
+ for i := 0; ; i++ {
+	 switch s := readgstatus(gp); s {
+	 default:
+
+	 case _Gpreempted:
+		 // 转换为 _Gwaiting
+		 if !casGFromPreempted(gp, _Gpreempted, _Gwaiting) {
+			 break
+		 }
+
+		 stopped = true
+
+		 s = _Gwaiting
+		 // 继续运行
+		 fallthrough
+
+	 case _Grunnable, _Gsyscall, _Gwaiting:
+		 if !castogscanstatus(gp, s, s|_Gscan) {
+			 break
+		 }
+
+		 // 清楚调度状态
+		 gp.preemptStop = false
+		 gp.preempt = false
+		 gp.stackguard0 = gp.stack.lo + _StackGuard
+
+		 // 返回被挂起的协程
+		 return suspendGState{g: gp, stopped: stopped}
+	 }
+ }
+}
+```
+这样发起抢占的线程就拥有了被抢占的协程的所有权，可以自主调用 `resumeG` 恢复执行（最终通过 `ready` 来恢复执行协程）。那么这两种抢占调度是否会冲突？并不会，因为无论是协作调度还是信号调度都会是被抢占的协程来执行，一定有一个先后顺序，如果其中一个调度成功，另一个检查是否需要调度的时候就不会通过。最终被抢占的协程再次被调度到执行时，会重置它所有的抢占状态。
+
+## 总结
+协程调度实现非常复杂，而且涉及了内存管理，网络轮询，定时器等等逻辑。这里忽略了涉及的其它模块，仅仅解释了调度的种类和过程。
