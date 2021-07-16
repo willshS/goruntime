@@ -1,7 +1,7 @@
 # M
-[GMP的起始](./GMP.md##起始)
+`M` 表示一个系统线程
 
-## M的主要字段
+## 1. M的主要字段
 ```
 type m struct {
 	g0      *g     // 调用栈
@@ -24,7 +24,7 @@ type m struct {
 	locks         int32  // 锁 禁止抢占？
 
 	spinning      bool // m 自旋
-	blocked       bool // m is blocked on a note
+	blocked       bool // m 阻塞
 	newSigstack   bool // minit on C thread called sigaltstack
 	printlock     int8
 
@@ -78,7 +78,7 @@ type m struct {
 }
 ```
 
-## M的创建
+## 2. M的创建
 以下代码是创建 `M` 的主流程，将 `M` 与系统线程相关联。系统调用 `clone` 在 `sys_linux_amd64.s` 文件中：
 ```
 func newm(fn func(), _p_ *p, id int64) {
@@ -101,7 +101,7 @@ func newosproc(mp *m) {
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 }
 ```
-### M的分配
+### 2.1 M的分配
 `M` 的核心逻辑在 `allocm` 中，这里真正创建了 `M` 的结构体以及对部分数据进行初始化：
 ```
 func allocm(_p_ *p, fn func(), id int64) *m {
@@ -156,3 +156,7 @@ func allocm(_p_ *p, fn func(), id int64) *m {
 	return mp
 }
 ```
+## 3. M的运行时
+// m的状态转换 协程绑定
+## 4. M的消亡
+// os线程的退出

@@ -9,34 +9,30 @@
 ```
 type schedt struct {
 	goidgen   uint64 // 原子访问，goroutine的id全局生成器
-	lastpoll  uint64 // time of last network poll, 0 if currently polling
+	lastpoll  uint64 // 上次网络轮询的时间，正在进行网络轮询的时候是0
 	pollUntil uint64 // time to which current poll is sleeping
 
 	lock mutex
 
 	midle        muintptr // 空闲M链表
 	nmidle       int32    // 空闲M数量
-	nmidlelocked int32    // number of locked m's waiting for work
-	mnext        int64    // number of m's that have been created and next M ID
-	maxmcount    int32    // maximum number of m's allowed (or die)
-	nmsys        int32    // number of system m's not counted for deadlock
-	nmfreed      int64    // cumulative number of freed m's
+	nmidlelocked int32    // 被绑定的空闲的M的数量
+	mnext        int64    // m的数量，也是下一个m的id的
+	maxmcount    int32    // 最大允许的m的数量
+	nmsys        int32    // 系统的M的数量
+	nmfreed      int64    // 释放的M的数量
 
-	ngsys uint32 // number of system goroutines; updated atomically
+	ngsys uint32 // 系统协程的数量 isSystemGoroutine 判断
 
 	pidle      puintptr // 空闲P链表
 	npidle     uint32	// 空间P数量
-	nmspinning uint32 // See "Worker thread parking/unparking" comment in proc.go.
+	nmspinning uint32 // 自旋M的数量
 
 	// 全局G 队列
 	runq     gQueue
 	runqsize int32
 
-	// disable controls selective disabling of the scheduler.
-	//
-	// Use schedEnableUser to control this.
-	//
-	// disable is protected by sched.lock.
+	// 有些情况下需要禁止调度
 	disable struct {
 		// user disables scheduling of user goroutines.
 		user     bool
@@ -52,7 +48,7 @@ type schedt struct {
 		n       int32
 	}
 
-	// Central cache of sudog structs.
+	// sudog的缓存
 	sudoglock  mutex
 	sudogcache *sudog
 
@@ -63,28 +59,24 @@ type schedt struct {
 	// 等待释放的M链表
 	freem *m
 
-	gcwaiting  uint32 // gc is waiting to run
-	stopwait   int32
-	stopnote   note
-	sysmonwait uint32
-	sysmonnote note
+	gcwaiting  uint32 // 1 gc等待运行
+	stopwait   int32  // 等待停止P的数量
+	stopnote   note	// note 当所有P停止，用来通知可以gc的
+	sysmonwait uint32	// sysmon的状态
+	sysmonnote note // sysmon的note
 
 	sysmonStarting uint32
 
 	// safepointFn should be called on each P at the next GC
-	// safepoint if p.runSafePointFn is set.
+	// safepoint if p.runSafePointFn is set. TODO:安全点
 	safePointFn   func(*p)
 	safePointWait int32
 	safePointNote note
 
-	procresizetime int64 // nanotime() of last change to gomaxprocs
+	procresizetime int64 // 上次改变P数量的时间
 	totaltime      int64 // ∫gomaxprocs dt up to procresizetime
 
-	// sysmonlock protects sysmon's actions on the runtime.
-	//
-	// Acquire and hold this mutex to block sysmon from interacting
-	// with the rest of the runtime.
-	sysmonlock mutex
+	sysmonlock mutex	//sysmon的锁
 }
 ```
 

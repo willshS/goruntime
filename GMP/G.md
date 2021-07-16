@@ -1,7 +1,7 @@
 # G
 `goroutine` 是 `go` 语言并发的基石，从本质来讲，它是用户级线程。通过实现调度算法，与系统级线程进行交互，从而使协程可以在线程上运行。  
 
-## G的主要字段
+## 1. G的主要字段
 `g` 保存了 `goroutine` 相关信息，注重到的是堆栈和调度信息以及相关状态。从这里看协程其实就是一组数据，是一个抽象的概念。因此对协程的执行，其实就是基于 `g` 结构体的执行相关指令。协程的调度，与线程的调度是一样的，恢复协程的栈，在栈上继续执行指令。
 ```
 type g struct {
@@ -21,23 +21,23 @@ type g struct {
 	goid         int64
 	schedlink    guintptr	// 调度链表
   // block相关
-	waitsince    int64      // approx time when the g become blocked
-	waitreason   waitReason // if status==Gwaiting
+	waitsince    int64      // 阻塞时间
+	waitreason   waitReason // 阻塞原因
   // 调度相关
-	preempt       bool // preemption signal, duplicates stackguard0 = stackpreempt
-	preemptStop   bool // transition to _Gpreempted on preemption; otherwise, just deschedule
-	preemptShrink bool // shrink stack at synchronous safe point
+	preempt       bool // 抢占标志
+	preemptStop   bool // 信号抢占不继续运行 等待 resume
+	preemptShrink bool // 抢占时是否可以进行栈收缩
   // 阻塞到chan上了
 	parkingOnChan uint8
 	gopc           uintptr         // 创建这个协程的协程的pc
 	startpc        uintptr         // 这个协程的开始程序计数器
-	waiting        *sudog         // sudog structures this g is waiting on (that have a valid elem ptr); in lock order
+	waiting        *sudog         // 等待的sudog
 	timer          *timer         // cached timer for time.Sleep
 	selectDone     uint32         // are we participating in a select and did someone win the race?
 }
 ```
 
-## G的创建
+## 2. G的创建
 创建 `goroutine` 是通过调用 `newProc`。即我们使用 `go func` 创建新协程。
 ```
 func newproc(siz int32, fn *funcval) {
@@ -68,7 +68,7 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 	siz := narg
 	siz = (siz + 7) &^ 7
 
-  // 复用一个空闲的G
+  // 复用一个空闲的G P中有G的空闲队列。
 	_p_ := _g_.m.p.ptr()
 	newg := gfget(_p_)
 	if newg == nil {
@@ -116,3 +116,8 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 	return newg
 }
 ```
+## 3. G的阵亡
+协程执行完毕会调用 `goexit0` （调度解释中有此函数说明），将协程状态清空后放入 `P` 的空闲池。
+
+## 4. 总结
+协程本质上保存了需要执行的指令、寄存器（各种参数）等，协程停止运行就是将这些数据保存，恢复运行取出这些数据继续执行即可。
