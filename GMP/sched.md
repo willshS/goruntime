@@ -56,7 +56,7 @@ type schedt struct {
 	deferlock mutex
 	deferpool [5]*_defer
 
-	// 等待释放的M链表
+	// 等待释放的M链表头
 	freem *m
 
 	gcwaiting  uint32 // 1 gc等待运行
@@ -215,6 +215,7 @@ func schedule() {
 	_g_ := getg()
 
 	if _g_.m.lockedg != 0 {
+		// 走到这里说明绑定的G阻塞了，在stoplockedm函数中进行P的移交以及系统线程的休眠等待被绑定的协程唤醒
 		stoplockedm()
 		// 如果绑定了g，直接运行绑定的g
 		execute(_g_.m.lockedg.ptr(), false) // Never returns.
@@ -1273,5 +1274,33 @@ func suspendG(gp *g) suspendGState {
 ```
 这样发起抢占的线程就拥有了被抢占的协程的所有权，可以自主调用 `resumeG` 恢复执行（最终通过 `ready` 来恢复执行协程）。那么这两种抢占调度是否会冲突？并不会，因为无论是协作调度还是信号调度都会是被抢占的协程来执行，一定有一个先后顺序，如果其中一个调度成功，另一个检查是否需要调度的时候就不会通过。最终被抢占的协程再次被调度到执行时，会重置它所有的抢占状态。
 
-## 总结
+## 5. 总结
 协程调度实现非常复杂，而且涉及了内存管理，网络轮询，定时器等等逻辑。这里忽略了涉及的其它模块，仅仅解释了调度的种类和过程。
+
+## 一点小补充
+为什么要有 `P` ? 以前的调度只有 `G` `M` 存在哪些问题？
+```
+1. Single global mutex (Sched.Lock) and centralized state. The mutex protects all
+goroutine-related operations (creation, completion, rescheduling, etc).
+2. Goroutine (G) hand-off (G.nextg). Worker threads (M's) frequently hand-off runnable
+goroutines between each other, this may lead to increased latencies and additional overheads.
+Every M must be able to execute any runnable G, in particular the M that just created the G.
+3. Per-M memory cache (M.mcache). Memory cache and other caches (stack alloc) are
+associated with all M's, while they need to be associated only with M's running Go code (an M
+blocked inside of syscall does not need mcache). A ratio between M's running Go code and all
+M's can be as high as 1:100. This leads to excessive resource consumption (each MCache can
+suck up up to 2M) and poor data locality.
+4. Aggressive thread blocking/unblocking. In presence of syscalls worker threads are frequently
+blocked and unblocked. This adds a lot of overhead.
+```
+1. 全局大锁和集中的状态管理。所有协程相关操作（创建，完成，调度等）都需要锁。
+2. 协程链表形式的组织方式。系统线程之间频繁交换可运行协程导致延迟增加和额外开销。
+3. 单线程缓存浪费。在系统调用时无需线程缓存，只有运行“用户”代码才需要，而运行用户代码的协程可能只有百分之一。
+4. 线程状态切换（阻塞/解除阻塞）。因为存在系统调用，线程会频繁的阻塞和解除阻塞，增加了很大的开销。
+
+`P` 是如何解决这些问题的？
+1. 保存基于 `P` 的可运行协程队列，缩小锁的粒度（基于无锁循环队列的原子操作。全局队列依然需要锁，但是因为本地队列，锁的竞争大大减小）
+2. 本地队列解决频繁交换可运行协程（尤其是当前线程刚创建的协程），增加窃取调度，仍然保留的全局队列减小饥饿的可能
+3. 将基于 `M` 的内存缓存移动到 `P`，并且增加系统调用调度算法，阻塞时可以移交 `P` 到其它线程。避免内存缓存无需使用而浪费
+4. 系统调用调度算法以及 `M` 的自旋，尽量保证有 `M` 为活跃状态（没有工作时），积极寻找工作，避免新建协程需要唤醒其它睡眠线程
+5. 增加 `G` 的缓存池， `M` 的缓存池。减少内存分配以及系统线程的创建销毁。

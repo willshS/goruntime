@@ -7,13 +7,10 @@ type m struct {
 	g0      *g     // 调用栈
 	morebuf gobuf  // gobuf arg to morestack
 
-	gsignal       *g           // signal-handling g
-	goSigStack    gsignalStack // Go-allocated signal handling stack
-	sigmask       sigset       // storage for saved signal mask
+	gsignal       *g           // 处理信号用的协程
 	tls           [6]uintptr   // thread-local storage (for x86 extern register)
 	mstartfn      func()   // 开始执行的函数
 	curg          *g       // 当前正在执行的G
-	caughtsig     guintptr // goroutine running during fatal signal
 	p             puintptr // 关联的P
 	nextp         puintptr // 即将使用的p
 	oldp          puintptr // the p that was attached before executing a syscall
@@ -21,60 +18,27 @@ type m struct {
 	mallocing     int32
 
 	preemptoff    string // if != "", keep curg running on this m
-	locks         int32  // 锁 禁止抢占？
+	locks         int32  // 锁 禁止抢占
 
 	spinning      bool // m 自旋
 	blocked       bool // m 阻塞
 	newSigstack   bool // minit on C thread called sigaltstack
-	printlock     int8
 
 	freeWait      uint32 // 如果等于0，可以安全的释放g0并且删除m
 	fastrand      [2]uint32 // 随机用的
-
-	traceback     uint8
-
-	doesPark      bool        // non-P running threads: sysmon and newmHandoff never use .park
-	park          note
+	park          note // M的挂起锁
 	alllink       *m // on allm
-	lockedg       guintptr
-	createstack   [32]uintptr // stack that created this thread.
-	lockedExt     uint32      // tracking for external LockOSThread
-	lockedInt     uint32      // tracking for internal lockOSThread
-	nextwaitm     muintptr    // next m waiting for lock
+	lockedg       guintptr	// 锁定的G
 	waitunlockf   func(*g, unsafe.Pointer) bool	// 挂起当前的G要执行的函数 可以为nil
 	waitlock      unsafe.Pointer  // 上面函数的第二个参数
 
-	startingtrace bool
-	syscalltick   uint32
-	freelink      *m // on sched.freem
+	freelink      *m // on sched.freem 链表
 
-	// these are here because they are too large to be on the stack
-	// of low-level NOSPLIT functions.
-	libcall   libcall
-	libcallpc uintptr // for cpu profiler
-	libcallsp uintptr
-	libcallg  guintptr
-	syscall   libcall // stores syscall parameters on windows
-
-	vdsoSP uintptr // SP for traceback while in VDSO call (0 if not in call)
-	vdsoPC uintptr // PC for traceback while in VDSO call
-
-	// preemptGen counts the number of completed preemption
-	// signals. This is used to detect when a preemption is
-	// requested, but fails. Accessed atomically.
+	// M成功处理信号的次数
 	preemptGen uint32
 
-	// Whether this is a pending preemption signal on this M.
-	// Accessed atomically.
+	// 这个M是否有信号没处理
 	signalPending uint32
-
-	dlogPerM
-
-	mOS
-
-	// Up to 10 locks held by this m, maintained by the lock ranking code.
-	locksHeldLen int
-	locksHeld    [10]heldLockInfo
 }
 ```
 
@@ -157,6 +121,123 @@ func allocm(_p_ *p, fn func(), id int64) *m {
 }
 ```
 ## 3. M的运行时
-// m的状态转换 协程绑定
+
+### 3.1 启动一个M
+启动 `M` 使用以下函数：
+```
+func startm(_p_ *p, spinning bool) {
+	mp := acquirem()
+	lock(&sched.lock)
+	if _p_ == nil {
+		// 获取一个空闲的P
+		_p_ = pidleget()
+		if _p_ == nil {
+			unlock(&sched.lock)
+			// 获取失败
+			if spinning {
+				if int32(atomic.Xadd(&sched.nmspinning, -1)) < 0 {
+					throw("startm: negative nmspinning")
+				}
+			}
+			// 不启动m了 没有p
+			releasem(mp)
+			return
+		}
+	}
+	// 获取一个空闲的M
+	nmp := mget()
+	if nmp == nil {
+		// 没有空闲的M 新建一个
+		id := mReserveID()
+		unlock(&sched.lock)
+
+		var fn func()
+		if spinning {
+			fn = mspinning
+		}
+		newm(fn, _p_, id)
+		releasem(mp)
+		return
+	}
+	unlock(&sched.lock)
+	if nmp.spinning {
+		throw("startm: m is spinning")
+	}
+	if nmp.nextp != 0 {
+		throw("startm: m has p")
+	}
+	if spinning && !runqempty(_p_) {
+		throw("startm: p has runnable gs")
+	}
+	nmp.spinning = spinning
+	// 给被唤醒的M 准备好P
+	nmp.nextp.set(_p_)
+	// 唤醒M
+	notewakeup(&nmp.park)
+	releasem(mp)
+}
+```
+有空闲的 `M` 就是用，没有的话新建。但是必须有相应的 `P` 进行绑定。**需要注意的是这是在一个线程中启动另一个线程**
+
+### 3.2 停止M
+```
+func stopm() {
+	_g_ := getg()
+	// m被加锁了 还在运行相关东西
+	if _g_.m.locks != 0 {
+		throw("stopm holding locks")
+	}
+	// m还持有p
+	if _g_.m.p != 0 {
+		throw("stopm holding p")
+	}
+	// m是自旋的
+	if _g_.m.spinning {
+		throw("stopm spinning")
+	}
+
+	lock(&sched.lock)
+	// 放入空闲队列
+	mput(_g_.m)
+	unlock(&sched.lock)
+	// m休眠
+	mPark()
+	// m被唤醒了
+	acquirep(_g_.m.nextp.ptr())
+	_g_.m.nextp = 0
+}
+```
+**与上面对应，空闲的M被唤醒后继续执行，被唤醒前P已经被准备好了**
+
+### 3.3 M的休眠
+```
+func mPark() {
+	g := getg()
+	for {
+		notesleep(&g.m.park)
+		noteclear(&g.m.park)
+		if !mDoFixup() {
+			return
+		}
+	}
+}
+```
+`mPark` 是唯一使 `M` 挂起的函数，它挂起的是一个真正的系统线程（要与 `suspendG` 协程挂起区分开 ）。  
+**结合调度文档中，可以看到一个M当没有P可与之绑定时（执行阻塞系统调用结束）会被休眠放入全局M空闲队列等待唤醒使用。这样做可以不频繁创建系统线程，其实本质是个线程池**
+
 ## 4. M的消亡
-// os线程的退出
+// os线程的退出 == mexit的调用-->schedule的函数退出:lockOSThread调用后不调用unlockosthread，线程的退出
+
+## 一点小补充 LockOSThread
+`LockOSThread` 可以将 `M` 和 `G` 进行绑定，使 `M` 只能运行绑定的 `G` （其实是在调度前，查看是否有绑定的 `G`，有则运行即可）
+```
+func dolockOSThread() {
+	_g_ := getg()
+	_g_.m.lockedg.set(_g_)
+	_g_.lockedm.set(_g_.m)
+}
+```
+**一般是调用c库使用，也可以通过此手段让我们某个重要的协程一直运行**
+
+## 两点小补充 notewakeup和notesleep
+这两个函数是系统线程 `M` 休眠和唤醒的核心函数。内部主要封装和使用了系统调用 `futex` 来进行线程的休眠和唤醒
