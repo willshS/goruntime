@@ -477,7 +477,7 @@ top:
 		}
 	}
 
-	// 这里是一个优化，先从网络轮询器里面查看是否有等待运行的G TODO:netpoll
+	// 这里是一个优化，先从网络轮询器里面查看是否有等待的G是否有数据
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
 		if list := netpoll(0); !list.empty() { // non-blocking
 			gp := list.pop()
