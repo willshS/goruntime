@@ -205,8 +205,9 @@ retry:
 	return toRun
 }
 ```
-此函数核心在于对于有事件触发时对 `goroutine` 的处理。先来看当我们读取或写入数据时没有数据或缓冲区的情况：
+此函数核心在于对于有事件触发时对 `goroutine` 的处理。
 ```
+// 此函数是挂起读或写的goroutine，并将pd.rg 修改为 当前goroutine
 func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 	gpp := &pd.rg
 	if mode == 'w' {
@@ -228,17 +229,50 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 		}
 	}
 
-	// need to recheck error states after setting gpp to pdWait
-	// this is necessary because runtime_pollUnblock/runtime_pollSetDeadline/deadlineimpl
-	// do the opposite: store to closing/rd/wd, membarrier, load of rg/wg
+	// 挂起协程 netpollblockcommit 函数中将pd.rg = goroutine
 	if waitio || netpollcheckerr(pd, mode) == 0 {
 		gopark(netpollblockcommit, unsafe.Pointer(gpp), waitReasonIOWait, traceEvGoBlockNet, 5)
 	}
-	// be careful to not lose concurrent pdReady notification
+	// 被唤醒 修改pd.rg
 	old := atomic.Xchguintptr(gpp, 0)
 	if old > pdWait {
 		throw("runtime: corrupted polldesc")
 	}
 	return old == pdReady
 }
+
+// 此函数取出上面挂起的goroutine 并返回出去等待调度
+func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
+	gpp := &pd.rg
+	if mode == 'w' {
+		gpp = &pd.wg
+	}
+
+	for {
+		old := *gpp
+		if old == pdReady {
+			return nil
+		}
+		if old == 0 && !ioready {
+			// Only set pdReady for ioready. runtime_pollWait
+			// will check for timeout/cancel before waiting.
+			return nil
+		}
+		var new uintptr
+		if ioready {
+			new = pdReady
+		}
+		if atomic.Casuintptr(gpp, old, new) {
+			if old == pdWait {
+				old = 0
+			}
+			return (*g)(unsafe.Pointer(old))
+		}
+	}
+}
 ```
+网络轮询器是线程安全的。上面是最核心的代码，将包含 `goroutine` 指针的 `pollDesc` 注册到 `epoll` 与 `redis` 的将事件数据结构（包含读写回调函数）注册到 `epoll` 其实是一个道理。当要读取数据或写入数据时，尝试直接读取或写入，若失败则将当前 `goroutine` 挂起，等待网络轮询触发事件将挂起的协程返回给外部等待调度。  
+**这里要提一下网络轮询的调用在监控线程实现中的 `sysmon` 和 调度算法中的 `findrunnable` 中进行。最开始的全局管道就是因为 `timer` 这个东西是在 `P` 上的，所以在阻塞等待网络轮询的时候可能需要打断检查一下 `timer` 。**
+
+## 5. deadline
+TODO: 分析timer后再看
