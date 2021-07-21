@@ -11,10 +11,10 @@ type pollDesc struct {
 	closing bool
 	everr   bool      // error发生
 	user    uint32    // 部分系统使用？
-	rseq    uintptr   // protects from stale read timers
-	rg      uintptr   // pdReady, pdWait, G waiting for read or nil
+	rseq    uintptr   // 此结构体重用或定时器被重置
+	rg      uintptr   // 状态
 	rt      timer     // 读定时器
-	rd      int64     // read deadline
+	rd      int64     // 定时器时间
 	wseq    uintptr   // protects from stale write timers
 	wg      uintptr   // pdReady, pdWait, G waiting for write or nil
 	wt      timer     // write deadline timer
@@ -31,13 +31,13 @@ func poll_runtime_pollServerInit() {
 }
 
 func netpollGenericInit() {
-  // 初始化标志 只会初始化一次
+    // 初始化标志 只会初始化一次
 	if atomic.Load(&netpollInited) == 0 {
 		lockInit(&netpollInitLock, lockRankNetpollInit)
 		lock(&netpollInitLock)
-    // 双检查
+        // 双检查
 		if netpollInited == 0 {
-      // 调用对应系统的初始化 epoll kqueue windows的io完成端口等
+            // 调用对应系统的初始化 epoll kqueue windows的io完成端口等
 			netpollinit()
 			atomic.Store(&netpollInited, 1)
 		}
@@ -48,7 +48,7 @@ func netpollGenericInit() {
 这里我们只关注 `epoll` 相关实现：
 ```
 func netpollinit() {
-  // 创建epoll
+    // 创建epoll
 	epfd = epollcreate1(_EPOLL_CLOEXEC)
 	if epfd < 0 {
 		epfd = epollcreate(1024)
@@ -58,7 +58,7 @@ func netpollinit() {
 		}
 		closeonexec(epfd)
 	}
-  // 创建非阻塞管道
+    // 创建非阻塞管道
 	r, w, errno := nonblockingPipe()
 	if errno != 0 {
 		println("runtime: pipe failed with", -errno)
@@ -68,13 +68,13 @@ func netpollinit() {
 		events: _EPOLLIN,
 	}
 	*(**uintptr)(unsafe.Pointer(&ev.data)) = &netpollBreakRd
-  // 注册管道到epoll
+    // 注册管道到epoll
 	errno = epollctl(epfd, _EPOLL_CTL_ADD, r, &ev)
 	if errno != 0 {
 		println("runtime: epollctl failed with", -errno)
 		throw("runtime: epollctl failed")
 	}
-  // 管道赋值给全局变量
+    // 管道赋值给全局变量
 	netpollBreakRd = uintptr(r)
 	netpollBreakWr = uintptr(w)
 }
@@ -85,7 +85,7 @@ func netpollinit() {
 想要监听 `IO` 就要添加相应的事件到 `epoll`。
 ```
 func poll_runtime_pollOpen(fd uintptr) (*pollDesc, int) {
-  // 缓存分配pollDesc
+    // 缓存分配pollDesc
 	pd := pollcache.alloc()
 	lock(&pd.lock)
 	if pd.wg != 0 && pd.wg != pdReady {
@@ -107,16 +107,16 @@ func poll_runtime_pollOpen(fd uintptr) (*pollDesc, int) {
 	unlock(&pd.lock)
 
 	var errno int32
-  // 添加事件
+    // 添加事件
 	errno = netpollopen(fd, pd)
 	return pd, int(errno)
 }
 
 func netpollopen(fd uintptr, pd *pollDesc) int32 {
 	var ev epollevent
-  // 这里读写事件都添加了，并且是ET模式
+    // 这里读写事件都添加了，并且是ET模式
 	ev.events = _EPOLLIN | _EPOLLOUT | _EPOLLRDHUP | _EPOLLET
-  // 数据直接就是 pollDesc
+    // 数据直接就是 pollDesc
 	*(**pollDesc)(unsafe.Pointer(&ev.data)) = pd
 	return -epollctl(epfd, _EPOLL_CTL_ADD, int32(fd), &ev)
 }
@@ -130,7 +130,7 @@ func netpoll(delay int64) gList {
 	if epfd == -1 {
 		return gList{}
 	}
-  // 处理参数
+    // 处理参数
 	var waitms int32
 	if delay < 0 {
     // 阻塞直到有数据
@@ -138,20 +138,20 @@ func netpoll(delay int64) gList {
 	} else if delay == 0 {
     // 非阻塞轮询一次
 		waitms = 0
-  // 阻塞一定时间
+    // 阻塞一定时间
 	} else if delay < 1e6 {
-    // 太小了
+        // 太小了
 		waitms = 1
 	} else if delay < 1e15 {
 		waitms = int32(delay / 1e6)
 	} else {
-    // 太大了
+        // 太大了
 		// 1e9 ms == ~11.5 days.
 		waitms = 1e9
 	}
 	var events [128]epollevent
 retry:
-  // 多路io复用
+    // 多路io复用
 	n := epollwait(epfd, &events[0], int32(len(events)), waitms)
 	if n < 0 {
 		if n != -_EINTR {
@@ -198,7 +198,7 @@ retry:
 			if ev.events == _EPOLLERR {
 				pd.everr = true
 			}
-      // 取出goroutine
+            // 取出goroutine
 			netpollready(&toRun, pd, mode)
 		}
 	}
@@ -213,11 +213,11 @@ func netpollblock(pd *pollDesc, mode int32, waitio bool) bool {
 	if mode == 'w' {
 		gpp = &pd.wg
 	}
-  // 修改pd中的状态为pdWait
+    // 修改pd中的状态为pdWait
 	for {
 		old := *gpp
-		if old == pdReady {
-      // 数据可能被其他G刚刚取走
+		if old == pdReady {      
+            // 数据可能被其他G刚刚取走
 			*gpp = 0
 			return true
 		}
@@ -260,7 +260,7 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 		if ioready {
 			new = pdReady
 		}
-    // 修改状态 如果是epoll_wait 这里就被修改为ready 对应上面挂起协程的唤醒检查 否则修改为0
+        // 修改状态 如果是epoll_wait 这里就被修改为ready 对应上面挂起协程的唤醒检查 否则修改为0
 		if atomic.Casuintptr(gpp, old, new) {
 			if old == pdWait {
 				old = 0
@@ -284,11 +284,11 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	}
 	rd0, wd0 := pd.rd, pd.wd
 	combo0 := rd0 > 0 && rd0 == wd0
-  // 计算d
+    // 计算d
 	if d > 0 {
 		d += nanotime()
 		if d <= 0 {
-      // 溢出处理
+            // 溢出处理
 			d = 1<<63 - 1
 		}
 	}
@@ -305,32 +305,32 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	}
 	if pd.rt.f == nil {
 		if pd.rd > 0 {
-      // 设置读超时函数为netpollReadDeadline
+            // 设置读超时函数为netpollReadDeadline
 			pd.rt.f = rtf
 			// 将当前pd和rseq赋值为timer参数，
 			pd.rt.arg = pd.makeArg()
 			pd.rt.seq = pd.rseq
-      // 设置timer
+            // 设置timer
 			resettimer(&pd.rt, pd.rd)
 		}
 	} else if pd.rd != rd0 || combo != combo0 {
 		pd.rseq++ // 如果当前已经设置了r deadline，这里进行修改
 		if pd.rd > 0 {
-      // 修改timer
+            // 修改timer
 			modtimer(&pd.rt, pd.rd, 0, rtf, pd.makeArg(), pd.rseq)
 		} else {
-      // 删除timer
+            // 删除timer
 			deltimer(&pd.rt)
 			pd.rt.f = nil
 		}
 	}
-  // 省略写
+    // 省略写
 	// 如果d小于0，唤醒挂起的协程，但是pd.rg或pd.wg状态是0，也就是没有数据
 	var rg, wg *g
 	if pd.rd < 0 || pd.wd < 0 {
 		atomic.StorepNoWB(noescape(unsafe.Pointer(&wg)), nil)
 		if pd.rd < 0 {
-      // 取出协程
+            // 取出协程
 			rg = netpollunblock(pd, 'r', false)
 		}
 		if pd.wd < 0 {
@@ -339,7 +339,7 @@ func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
 	}
 	unlock(&pd.lock)
 	if rg != nil {
-    // 唤醒
+        // 唤醒
 		netpollgoready(rg, 3)
 	}
 	if wg != nil {
@@ -356,7 +356,7 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 		currentSeq = pd.wseq
 	}
 	if seq != currentSeq {
-    // seq变了，说明timer重置了
+        // seq变了，说明timer重置了
 		unlock(&pd.lock)
 		return
 	}
@@ -365,15 +365,15 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 		if pd.rd <= 0 || pd.rt.f == nil {
 			throw("runtime: inconsistent read deadline")
 		}
-    // 这里把rd赋值为-1
+        // 这里把rd赋值为-1
 		pd.rd = -1
 		atomic.StorepNoWB(unsafe.Pointer(&pd.rt.f), nil) // full memory barrier between store to rd and load of rg in netpollunblock
-    // 取出挂起的协程
+        // 取出挂起的协程
 		rg = netpollunblock(pd, 'r', false)
 	}
 	unlock(&pd.lock)
 	if rg != nil {
-    // 唤醒
+        // 唤醒
 		netpollgoready(rg, 0)
 	}
 }
@@ -382,7 +382,8 @@ func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
 **如果协程进来等待，则状态被置为pdwait，然后被修改为挂起的G**
 1. **有数据唤醒，即调用epoll_wait被唤醒，状态被置为pdready，并调度挂起的G**
 2. **若timer到期被唤醒，则状态被置为0，并调度挂起的G**
-3. **被唤醒的G检查唤醒时的状态，若为0则代表没有数据此时rd为-1，返回调用者timeout。若为pdready，则表示有数据，去读写即可。最后将状态再次修改为0**
+3. **被唤醒的G检查唤醒时的状态，若为0则代表没有数据此时rd为-1，返回调用者timeout。若为pdready，则表示有数据，去读写即可。最后将状态再次修改为0**  
+
 以上是网络轮询器对于状态的转换，是实现 `deadline` 的核心。
 
 ## 6. 总结

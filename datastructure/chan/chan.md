@@ -76,7 +76,7 @@ func makechan(t *chantype, size int) *hchan {
 	var c *hchan
 	switch {
 	case mem == 0:
-	  // 当参数size为0 或 元素类型大小为0 的时候，说明不需要额外内存
+        // 当参数size为0 或 元素类型大小为0 的时候，说明不需要额外内存
 		c = (*hchan)(mallocgc(hchanSize, nil, true))
 		c.buf = c.raceaddr()
 	case elem.ptrdata == 0:

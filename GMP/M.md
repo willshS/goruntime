@@ -46,11 +46,11 @@ type m struct {
 以下代码是创建 `M` 的主流程，将 `M` 与系统线程相关联。系统调用 `clone` 在 `sys_linux_amd64.s` 文件中：
 ```
 func newm(fn func(), _p_ *p, id int64) {
-  // 分配一个m
+    // 分配一个m
 	mp := allocm(_p_, fn, id)
-  // TODO:是否暂停？
+    // TODO:是否暂停？
 	mp.doesPark = (_p_ != nil)
-  // 保存p到即将使用的p
+    // 保存p到即将使用的p
 	mp.nextp.set(_p_)
 	mp.sigmask = initSigmask
 	newm1(mp)

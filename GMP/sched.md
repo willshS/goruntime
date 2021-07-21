@@ -323,7 +323,7 @@ func main() {
 		})
 	}
 
-	// 锁线程 TODO：补充
+	// 锁线程
 	lockOSThread()
 	// 只有主线程m0 可以运行main
 	if g.m != &m0 {
@@ -454,7 +454,7 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	2. 从网络轮询器中查看是否有可运行的
 	3. 随机去所有P里面偷，偷的顺序是随机的，最多尝试4次（如果全部失败，最后还会检查一次）
 
-**TODO：上面的过程极其复杂，还涉及到了gc的工作，timer相关，以及网络轮询器。后面再一一分析。**
+**TODO：上面的过程极其复杂，还涉及到了gc的工作，timer相关。后面再一一分析。**
 ```
 func findrunnable() (gp *g, inheritTime bool) {
 	_g_ := getg()
@@ -479,6 +479,7 @@ top:
 
 	// 这里是一个优化，先从网络轮询器里面查看是否有等待的G是否有数据
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
+        // 非阻塞网络轮询
 		if list := netpoll(0); !list.empty() { // non-blocking
 			gp := list.pop()
 			injectglist(&list)

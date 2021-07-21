@@ -21,7 +21,7 @@ func NewReader(rd io.Reader) *Reader
 // 根据第二个参数创建缓冲区
 func NewReaderSize(rd io.Reader, size int) *Reader {
 	// 判断传进来的是不是已经是我们的带缓冲区的Reader了
-  // 因为我们封装的是接口，所以这里缓冲区够用的话，就不让套娃了
+    // 因为我们封装的是接口，所以这里缓冲区够用的话，就不让套娃了
 	b, ok := rd.(*Reader)
 	if ok && len(b.buf) >= size {
 		return b
@@ -30,7 +30,7 @@ func NewReaderSize(rd io.Reader, size int) *Reader {
 		size = minReadBufferSize
 	}
 	r := new(Reader)
-  // 这里创建了slice
+    // 这里创建了slice
 	r.reset(make([]byte, size), rd)
 	return r
 }

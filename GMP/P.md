@@ -14,7 +14,7 @@ type p struct {
 	mcache      *mcache  // P的本地缓存
 	pcache      pageCache
 
-  // defer相关
+    // defer相关
 	deferpool    [5][]*_defer // pool of available defer structs of different sizes (see panic.go)
 	deferpoolbuf [5][32]*_defer
 
@@ -27,7 +27,7 @@ type p struct {
 	runqtail uint32  // 尾的下标
 	runq     [256]guintptr // 本地G环形队列
 
-  // 下一个要运行的G，可能为空。继承当前G剩下的时间片如果还有剩余的话。
+    // 下一个要运行的G，可能为空。继承当前G剩下的时间片如果还有剩余的话。
 	runnext guintptr
 
 	// G的空闲队列缓存

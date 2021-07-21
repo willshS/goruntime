@@ -217,7 +217,7 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	}
 
 again:
-  // 拿到桶的下标
+    // 拿到桶的下标
 	bucket := hash & bucketMask(h.B)
 	// 如果在rehash，rehash一下
 	if h.growing() {

@@ -58,7 +58,7 @@ type slice struct {
 0x006d 00109 (main.go:9)        MOVQ    $10, "".b+368(SP)
 
 func makeslice(et *_type, len, cap int) unsafe.Pointer {
-  // 检查内存
+    // 检查内存
 	mem, overflow := math.MulUintptr(et.size, uintptr(cap))
 	if overflow || mem > maxAlloc || len < 0 || len > cap {
 		mem, overflow := math.MulUintptr(et.size, uintptr(len))
@@ -92,7 +92,7 @@ func growslice(et *_type, old slice, cap int) slice {
 	}
 
 	if et.size == 0 {
-    // 类型长度为0，特殊处理，底层数组不用扩容
+        // 类型长度为0，特殊处理，底层数组不用扩容
 		return slice{unsafe.Pointer(&zerobase), old.len, cap}
 	}
 
@@ -102,10 +102,10 @@ func growslice(et *_type, old slice, cap int) slice {
 		newcap = cap
 	} else {
 		if old.cap < 1024 {
-      // 小于1k 简单扩容2倍
+            // 小于1k 简单扩容2倍
 			newcap = doublecap
 		} else {
-      // 否则每次增加过去的 1/4 直到满足所需容量。 0 < newcap 为了检查溢出
+            // 否则每次增加过去的 1/4 直到满足所需容量。 0 < newcap 为了检查溢出
 			for 0 < newcap && newcap < cap {
 				newcap += newcap / 4
 			}
@@ -166,11 +166,11 @@ func growslice(et *_type, old slice, cap int) slice {
 	} else {
 		p = mallocgc(capmem, et, true)
 		if lenmem > 0 && writeBarrier.enabled {
-      // 写屏障相关
+            // 写屏障相关
 			bulkBarrierPreWriteSrcOnly(uintptr(p), uintptr(old.array), lenmem-et.size+et.ptrdata)
 		}
 	}
-  // 旧的数组数据移动到新的内存
+    // 旧的数组数据移动到新的内存
 	memmove(p, old.array, lenmem)
 
 	return slice{p, old.len, newcap}
