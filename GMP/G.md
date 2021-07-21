@@ -32,7 +32,7 @@ type g struct {
     gopc           uintptr         // 创建这个协程的协程的pc
     startpc        uintptr         // 这个协程的开始程序计数器
     waiting        *sudog         // 等待的sudog
-    timer          *timer         // cached timer for time.Sleep
+    timer          *timer         // G的sleep timer
     selectDone     uint32         // are we participating in a select and did someone win the race?
 }
 ```
