@@ -6,12 +6,12 @@
 
 ```
 type Reader struct {
-	buf          []byte
-	rd           io.Reader // 一个Reader接口，可以是文件句柄，socket等
-	r, w         int       // 缓冲区的读写位置
-	err          error
-	lastByte     int // last byte read for UnreadByte; -1 means invalid
-	lastRuneSize int // size of last rune read for UnreadRune; -1 means invalid
+    buf          []byte
+    rd           io.Reader // 一个Reader接口，可以是文件句柄，socket等
+    r, w         int       // 缓冲区的读写位置
+    err          error
+    lastByte     int // last byte read for UnreadByte; -1 means invalid
+    lastRuneSize int // size of last rune read for UnreadRune; -1 means invalid
 }
 ```
 初始化的方法有以下两种：
@@ -20,19 +20,19 @@ type Reader struct {
 func NewReader(rd io.Reader) *Reader
 // 根据第二个参数创建缓冲区
 func NewReaderSize(rd io.Reader, size int) *Reader {
-	// 判断传进来的是不是已经是我们的带缓冲区的Reader了
+    // 判断传进来的是不是已经是我们的带缓冲区的Reader了
     // 因为我们封装的是接口，所以这里缓冲区够用的话，就不让套娃了
-	b, ok := rd.(*Reader)
-	if ok && len(b.buf) >= size {
-		return b
-	}
-	if size < minReadBufferSize {
-		size = minReadBufferSize
-	}
-	r := new(Reader)
+    b, ok := rd.(*Reader)
+    if ok && len(b.buf) >= size {
+        return b
+    }
+    if size < minReadBufferSize {
+        size = minReadBufferSize
+    }
+    r := new(Reader)
     // 这里创建了slice
-	r.reset(make([]byte, size), rd)
-	return r
+    r.reset(make([]byte, size), rd)
+    return r
 }
 ```
 这个工具包常用来对 `socket` 进行一层封装。将 `net.Conn` 作为参数生成 `Writer` 和 `Reader` 对象。使用相应的方法可以省去我们直接读取 `socket` 需要自己去管理缓冲区的麻烦。
@@ -44,7 +44,7 @@ bodyLen, err := readLen(client.Reader, client.lenSlice)
 ......
 // 根据header数据拿到bodyLen，读取所有数据到body
 body := make([]byte, bodyLen)
-	_, err = io.ReadFull(client.Reader, body)
+    _, err = io.ReadFull(client.Reader, body)
 ```
 可以看到，以上用法非常轻松的把我们从读取 `socket` 中解放出来，只需要关心自己定的协议即可。
 ```
@@ -53,13 +53,13 @@ body := make([]byte, bodyLen)
 binary.BigEndian.PutUint32(beBuf, size)
 n, err := w.Write(beBuf)
 if err != nil {
-	return n, err
+    return n, err
 }
 
 binary.BigEndian.PutUint32(beBuf, uint32(frameType))
 n, err = w.Write(beBuf)
 if err != nil {
-	return n + 4, err
+    return n + 4, err
 }
 // 最后写入body
 n, err = w.Write(data)
@@ -69,36 +69,36 @@ n, err = w.Write(data)
 ```
 // 从外面传进来一个切片  不要让Reader对象再自动生成
 func (b *Reader) ResetBuffer(r io.Reader, buf []byte) {
-	b.reset(buf, r)
+    b.reset(buf, r)
 }
 
 // 返回值与环形队列共享一个底层数组，这样做也有问题，就是如果你数据还没使用，可能被下一次读的数据覆盖
 func (b *Reader) Pop(n int) ([]byte, error) {
-	d, err := b.Peek(n)
-	if err == nil {
-		b.r += n
-		return d, err
-	}
-	return nil, err
+    d, err := b.Peek(n)
+    if err == nil {
+        b.r += n
+        return d, err
+    }
+    return nil, err
 }
 
 // 与读的Pop一样，调用这个函数将写的环形队列返回。缺点也是相同的。
 func (b *Writer) Peek(n int) ([]byte, error) {
-	if n < 0 {
-		return nil, ErrNegativeCount
-	}
-	if n > len(b.buf) {
-		return nil, ErrBufferFull
-	}
-	for b.Available() < n && b.err == nil {
-		b.flush()
-	}
-	if b.err != nil {
-		return nil, b.err
-	}
-	d := b.buf[b.n : b.n+n]
-	b.n += n
-	return d, nil
+    if n < 0 {
+        return nil, ErrNegativeCount
+    }
+    if n > len(b.buf) {
+        return nil, ErrBufferFull
+    }
+    for b.Available() < n && b.err == nil {
+        b.flush()
+    }
+    if b.err != nil {
+        return nil, b.err
+    }
+    d := b.buf[b.n : b.n+n]
+    b.n += n
+    return d, nil
 }
 ```
 上面的这些缺点是可以从调用角度解决的。比如 `goim` 是这样做的，同一个 `socket` 读协程只有一个，按照顺序读，每次读完就立刻处理数据，处理完毕再进行下一次读。对于写是相同的道理。这样相比于 `nsq` 的用法就少了一次拷贝。最重要的是可以自己管理环形队列这块内存，`goim` 就是自己写了个内存池来管理这些内存，避免gc频繁。
