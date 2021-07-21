@@ -254,14 +254,13 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 			return nil
 		}
 		if old == 0 && !ioready {
-			// Only set pdReady for ioready. runtime_pollWait
-			// will check for timeout/cancel before waiting.
 			return nil
 		}
 		var new uintptr
 		if ioready {
 			new = pdReady
 		}
+    // 修改状态 如果是epoll_wait 这里就被修改为ready 对应上面挂起协程的唤醒检查 否则修改为0
 		if atomic.Casuintptr(gpp, old, new) {
 			if old == pdWait {
 				old = 0
@@ -275,4 +274,119 @@ func netpollunblock(pd *pollDesc, mode int32, ioready bool) *g {
 **这里要提一下网络轮询的调用在监控线程实现中的 `sysmon` 和 调度算法中的 `findrunnable` 中进行。最开始的全局管道就是因为 `timer` 这个东西是在 `P` 上的，所以在阻塞等待网络轮询的时候可能需要打断检查一下 `timer` 。**
 
 ## 5. deadline
-TODO: 分析timer后再看
+### 5.1 设置deadline
+```
+func poll_runtime_pollSetDeadline(pd *pollDesc, d int64, mode int) {
+	lock(&pd.lock)
+	if pd.closing {
+		unlock(&pd.lock)
+		return
+	}
+	rd0, wd0 := pd.rd, pd.wd
+	combo0 := rd0 > 0 && rd0 == wd0
+  // 计算d
+	if d > 0 {
+		d += nanotime()
+		if d <= 0 {
+      // 溢出处理
+			d = 1<<63 - 1
+		}
+	}
+	if mode == 'r' || mode == 'r'+'w' {
+		pd.rd = d
+	}
+	if mode == 'w' || mode == 'r'+'w' {
+		pd.wd = d
+	}
+	combo := pd.rd > 0 && pd.rd == pd.wd
+	rtf := netpollReadDeadline
+	if combo {
+		rtf = netpollDeadline
+	}
+	if pd.rt.f == nil {
+		if pd.rd > 0 {
+      // 设置读超时函数为netpollReadDeadline
+			pd.rt.f = rtf
+			// 将当前pd和rseq赋值为timer参数，
+			pd.rt.arg = pd.makeArg()
+			pd.rt.seq = pd.rseq
+      // 设置timer
+			resettimer(&pd.rt, pd.rd)
+		}
+	} else if pd.rd != rd0 || combo != combo0 {
+		pd.rseq++ // 如果当前已经设置了r deadline，这里进行修改
+		if pd.rd > 0 {
+      // 修改timer
+			modtimer(&pd.rt, pd.rd, 0, rtf, pd.makeArg(), pd.rseq)
+		} else {
+      // 删除timer
+			deltimer(&pd.rt)
+			pd.rt.f = nil
+		}
+	}
+  // 省略写
+	// 如果d小于0，唤醒挂起的协程，但是pd.rg或pd.wg状态是0，也就是没有数据
+	var rg, wg *g
+	if pd.rd < 0 || pd.wd < 0 {
+		atomic.StorepNoWB(noescape(unsafe.Pointer(&wg)), nil)
+		if pd.rd < 0 {
+      // 取出协程
+			rg = netpollunblock(pd, 'r', false)
+		}
+		if pd.wd < 0 {
+			wg = netpollunblock(pd, 'w', false)
+		}
+	}
+	unlock(&pd.lock)
+	if rg != nil {
+    // 唤醒
+		netpollgoready(rg, 3)
+	}
+	if wg != nil {
+		netpollgoready(wg, 3)
+	}
+}
+```
+### 5.2 timer到期函数
+```
+func netpolldeadlineimpl(pd *pollDesc, seq uintptr, read, write bool) {
+	lock(&pd.lock)
+	currentSeq := pd.rseq
+	if !read {
+		currentSeq = pd.wseq
+	}
+	if seq != currentSeq {
+    // seq变了，说明timer重置了
+		unlock(&pd.lock)
+		return
+	}
+	var rg *g
+	if read {
+		if pd.rd <= 0 || pd.rt.f == nil {
+			throw("runtime: inconsistent read deadline")
+		}
+    // 这里把rd赋值为-1
+		pd.rd = -1
+		atomic.StorepNoWB(unsafe.Pointer(&pd.rt.f), nil) // full memory barrier between store to rd and load of rg in netpollunblock
+    // 取出挂起的协程
+		rg = netpollunblock(pd, 'r', false)
+	}
+	unlock(&pd.lock)
+	if rg != nil {
+    // 唤醒
+		netpollgoready(rg, 0)
+	}
+}
+```
+**这里要与第4节的状态一起看。状态有pdready、pdwait、0、G这几种。**
+**如果协程进来等待，则状态被置为pdwait，然后被修改为挂起的G**
+1. **有数据唤醒，即调用epoll_wait被唤醒，状态被置为pdready，并调度挂起的G**
+2. **若timer到期被唤醒，则状态被置为0，并调度挂起的G**
+3. **被唤醒的G检查唤醒时的状态，若为0则代表没有数据此时rd为-1，返回调用者timeout。若为pdready，则表示有数据，去读写即可。最后将状态再次修改为0**
+以上是网络轮询器对于状态的转换，是实现 `deadline` 的核心。
+
+## 6. 总结
+网络轮询器的重点有两个：
+1. 注册 `pd` 到 `epoll`。挂起等待数据的协程并赋值给 `pd`
+2. 数据就绪或时间到期后从 `epoll` 中读取 `pd` 的协程并唤醒
+3. 被唤醒的协程检查状态，判断是数据就绪就去读取，判断是时间到期则返回 `timeout`
