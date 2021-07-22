@@ -10,7 +10,7 @@
 type schedt struct {
     goidgen   uint64 // 原子访问，goroutine的id全局生成器
     lastpoll  uint64 // 上次网络轮询的时间，正在进行网络轮询的时候是0
-    pollUntil uint64 // time to which current poll is sleeping
+    pollUntil uint64 // 当前阻塞网络轮询前的时间
 
     lock mutex
 
@@ -224,6 +224,8 @@ func schedule() {
 top:
     pp := _g_.m.p.ptr()
     pp.preempt = false
+    // 运行定时器
+    checkTimers(pp, 0)
 
     var gp *g
     var inheritTime bool
@@ -454,12 +456,13 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
     2. 从网络轮询器中查看是否有可运行的
     3. 随机去所有P里面偷，偷的顺序是随机的，最多尝试4次（如果全部失败，最后还会检查一次）
 
-**TODO：上面的过程极其复杂，还涉及到了gc的工作，timer相关。后面再一一分析。**
+**TODO：上面的过程极其复杂，还涉及到了gc的工作。后面再一一分析。**
 ```
 func findrunnable() (gp *g, inheritTime bool) {
     _g_ := getg()
 top:
     _p_ := _g_.m.p.ptr()
+    // 检查timer，运行到期的timer，并返回下次应该运行的时间
     now, pollUntil, _ := checkTimers(_p_, 0)
 
     // 再次尝试本地队列
@@ -513,22 +516,15 @@ top:
                 continue
             }
 
-            // TODO: timer
             if stealTimersOrRunNextG && timerpMask.read(enum.position()) {
+                // 运行最后一个P的定时器
                 tnow, w, ran := checkTimers(p2, now)
                 now = tnow
                 if w != 0 && (pollUntil == 0 || w < pollUntil) {
                     pollUntil = w
                 }
                 if ran {
-                    // Running the timers may have
-                    // made an arbitrary number of G's
-                    // ready and added them to this P's
-                    // local run queue. That invalidates
-                    // the assumption of runqsteal
-                    // that is always has room to add
-                    // stolen G's. So check now if there
-                    // is a local G to run.
+                    // 当我们运行了别的P的定时器，可能有G准备好了，再次尝试偷G
                     if gp, inheritTime := runqget(_p_); gp != nil {
                         return gp, inheritTime
                     }
@@ -598,7 +594,7 @@ stop:
         }
     }
 
-    // 跟上面一样，看有没有timer？ TODO:
+    // 检查所有P的timer最接近的时间
     for id, _p_ := range allpSnapshot {
         if timerpMaskSnapshot.read(uint32(id)) {
             w := nobarrierWakeTime(_p_)
@@ -607,6 +603,7 @@ stop:
             }
         }
     }
+    // 通过最接近的timer时间来确定下面网络轮询阻塞的时间。保证timer可以及时触发运行
     if pollUntil != 0 {
         if now == 0 {
             now = nanotime()
@@ -619,11 +616,63 @@ stop:
 
     // 再次检查gc的工作和网络轮询器的工作
 
+    // poll network
+    if netpollinited() && (atomic.Load(&netpollWaiters) > 0 || pollUntil != 0) && atomic.Xchg64(&sched.lastpoll, 0) != 0 {
+        atomic.Store64(&sched.pollUntil, uint64(pollUntil))
+        if _g_.m.p != 0 {
+            throw("findrunnable: netpoll with p")
+        }
+        if _g_.m.spinning {
+            throw("findrunnable: netpoll with spinning")
+        }
+        if faketime != 0 {
+            // When using fake time, just poll.
+            delta = 0
+        }
+        list := netpoll(delta) // 阻塞调用 下次timer-当前时间
+        atomic.Store64(&sched.pollUntil, 0)
+        atomic.Store64(&sched.lastpoll, uint64(nanotime()))
+        if faketime != 0 && list.empty() {
+            // Using fake time and nothing is ready; stop M.
+            // When all M's stop, checkdead will call timejump.
+            stopm()
+            goto top
+        }
+        lock(&sched.lock)
+        _p_ = pidleget()
+        unlock(&sched.lock)
+        if _p_ == nil {
+            injectglist(&list)
+        } else {
+            acquirep(_p_)
+            if !list.empty() {
+                gp := list.pop()
+                injectglist(&list)
+                casgstatus(gp, _Gwaiting, _Grunnable)
+                if trace.enabled {
+                    traceGoUnpark(gp, 0)
+                }
+                return gp, false
+            }
+            if wasSpinning {
+                _g_.m.spinning = true
+                atomic.Xadd(&sched.nmspinning, 1)
+            }
+            goto top
+        }
+    } else if pollUntil != 0 && netpollinited() {
+        pollerPollUntil := int64(atomic.Load64(&sched.pollUntil))
+        // 下次timer的时间小于当前轮询前的时间，打断一下。
+        if pollerPollUntil == 0 || pollerPollUntil > pollUntil {
+            netpollBreak()
+        }
+    }
+
     // 停止M
     stopm()
     goto top
 }
-```  
+```
 可以看到整个调度的核心就是找可运行的协程。
 ### 3.3 可运行G的执行完毕
 协程执行完毕后，会调用以下函数：
