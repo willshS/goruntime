@@ -43,10 +43,10 @@ func main() {
 type timer struct {
     pp puintptr // timer所在的P
     when   int64 // timer的到期时间
-    period int64
+    period int64 // 周期 第一次触发后每隔period再次触发
     f      func(interface{}, uintptr) // timer到期执行的函数
     arg    interface{} // f的参数
-    seq    uintptr //
+    seq    uintptr // 主要是netpoll在用 f的第二个参数
     nextwhen int64 // timer被修改后的时间
     status uint32 // timer的状态
 }
@@ -442,6 +442,43 @@ func runOneTimer(pp *p, t *timer, now int64) {
     lock(&pp.timersLock)
 }
 ```
+
+## 4. timer & ticker
+`time.NewTimer` 和 `time.NewTicker` 两中定时器的差别其实看一下这两个函数即可：
+```
+func NewTicker(d Duration) *Ticker {
+    if d <= 0 {
+        panic(errors.New("non-positive interval for NewTicker"))
+    }
+    c := make(chan Time, 1)
+    t := &Ticker{
+        C: c,
+        r: runtimeTimer{
+            when:   when(d),
+            period: int64(d),
+            f:      sendTime,
+            arg:    c,
+        },
+    }
+    startTimer(&t.r)
+    return t
+}
+
+func NewTimer(d Duration) *Timer {
+    c := make(chan Time, 1)
+    t := &Timer{
+        C: c,
+        r: runtimeTimer{
+            when: when(d),
+            f:    sendTime,
+            arg:  c,
+        },
+    }
+    startTimer(&t.r)
+    return t
+}
+```
+可以看到 `ticker` 多了一个安全检查以及 `runtime.timer` 结构体的 `period` 字段。而 `period` 字段在我们执行定时器的时候，会重新修改 `when` 类似于 `when = when + period`，然后重新在 `P` 的四叉堆中找到位置。而如果 `period` 字段为0，则定时器执行完毕会被直接删除。
 
 ## 总结
 因为存在跨 `P` 运行定时器的情况，因此定时器实现的复杂度稍微高了一点，整体设计通过四叉堆维护定时器，直接访问最早的定时器，获取最早定时器的触发时间点，并通过唤醒阻塞 `netpoll` 的线程来进行及时触发运行定时器。
