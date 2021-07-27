@@ -669,9 +669,7 @@ func evacuate(t *maptype, h *hmap, oldbucket uintptr) {
 
 func advanceEvacuationMark(h *hmap, t *maptype, newbit uintptr) {
     h.nevacuate++
-    // 这里为了做个保护，不是太明白 TODO：
-    // Experiments suggest that 1024 is overkill by at least an order of magnitude.
-    // Put it in there as a safeguard anyway, to ensure O(1) behavior.
+    // 这里为了做个保护，不要无限制检查下去，1024是一个经验值
     stop := h.nevacuate + 1024
     if stop > newbit {
         stop = newbit

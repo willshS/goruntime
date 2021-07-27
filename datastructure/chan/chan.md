@@ -293,7 +293,6 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
 
     if !block && empty(c) {
         // 这里判断如果为空再去判断是否关闭，否则一起判断如果关闭的话，会造成锁的竞争。
-        // 这里的注释非常难以理解。包括为何使用原子操作等。（TODO:）
         if atomic.Load(&c.closed) == 0 {
             // 关闭操作是不可逆的，因此这里如果没有关闭，那么上面的判断时肯定也是没有关闭的。同理，下面的一定是关闭的时候发生。
             return

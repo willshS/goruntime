@@ -19,8 +19,13 @@ read go source.
 
 ## [tool](./tool)
 ###### [flag](./tool/flag/flag.md)
-###### [flag](./tool/bufio/bufio.md)
+###### [bufio](./tool/bufio/bufio.md)
 
+## TODO
+chan : 内存分配的方式（是否包含指针）& 栈收缩
+interface : fmt的实现对结果的影响
+map : key的更新 needkeyupdate
+调度: gc相关
 
 ## 调试
 runtime代码大部分可以直接调试（我使用的vscode+gdb插件，直接断点调试）。多协程可能难以调试，但是可以通过修改runtime代码来打印日志进行调试（使用root权限改就行了）。
