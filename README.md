@@ -23,6 +23,7 @@ read go source.
 
 ## TODO
 chan : 内存分配的方式（是否包含指针）& 栈收缩  
+interface ： 编译器中接口的数据初始化 （类型信息处理）  
 map : key的更新 needkeyupdate  
 调度: gc相关  
 
