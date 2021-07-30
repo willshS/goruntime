@@ -17,73 +17,175 @@
 4. `mheap` 中没有，去操作系统申请一组页
 ------------------------------------------------------------------------
 
-## 数据结构
-`runtime/sizeclasses.go` 文件中定义了小对象的相关信息：
+## 内存分配
+我们可以从 `slice`、`map`、`chan` 等实现中看到，申请内存使用的函数都是 `mallocgc` ：
 ```
-// class  bytes/obj  bytes/span  objects  tail waste  max waste
-//     1          8        8192     1024           0     87.50%
-//     2         16        8192      512           0     43.75%
-//     3         24        8192      341           8     29.24%
-//     4         32        8192      256           0     21.88%
-...............................................................
-//    64      24576       24576        1           0     11.45%
-//    65      27264       81920        3         128     10.00%
-//    66      28672       57344        2           0      4.91%
-//    67      32768       32768        1           0     12.50%
-```
-`class` 表示对象的 `id`，后面内存都需要使用对应的 `class` 来进行内存的管理。  
-`bytes/obj` 表示对象的大小，单位为字节  
-`bytes/span` 表示存储此对象的内存块的大小  
-`objects` 表示这个内存块能放多少个对象。相当于这个内存块有这么多个槽可以放对象  
-`tail waste` 表示这个内存块装满对象后还有多少内存没有被使用，被浪费了  
-`max waste` TODO:最大的浪费率，`maxWaste := float64((c.size-prevSize-1)*objects+tailWaste) / float64(spanSize)`. 计算方式有点不懂。  
-以 `class` 为4举例：分配内存为32字节大小的对象，内存管理中内存块大小为8192字节，可以分配256个对象。对于小对象的内存管理就是基于此表来进行的。  
+func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
+	if gcphase == _GCmarktermination {
+		throw("mallocgc called with gcphase == _GCmarktermination")
+	}
 
-### mspan
-`mspan` 就是上表中的 `span` 内存块，用来管理一个内存块，可以看到不同 `class` 的内存块大小不同，一个内存块中的基本代为是 `page` ，一个页大小为8k，因此不同类型的内存块可能对应一个或多个页。
-```
-type mspan struct {
-	next *mspan     // next
-	prev *mspan     // pre
+	if size == 0 {
+		return unsafe.Pointer(&zerobase)
+	}
 
-	startAddr uintptr // 内存块的起始地址
-	npages    uintptr // 内存块包含的page数量
+	// Set mp.mallocing to keep from being preempted by GC.
+	mp := acquirem()
+	mp.mallocing = 1
 
-	manualFreeList gclinkptr // list of free objects in mSpanManual spans
-	freeindex uintptr  // 下一次开始查找空位的槽
-	nelems uintptr // 内存块中的槽数，即可以存放的对象的数量
+	shouldhelpgc := false
+	dataSize := size
+	c := getMCache()
+	if c == nil {
+		throw("mallocgc called without a P or outside bootstrapping")
+	}
+	var span *mspan
+	var x unsafe.Pointer
+	noscan := typ == nil || typ.ptrdata == 0
+	if size <= maxSmallSize {
+		if noscan && size < maxTinySize {
+			// tiny 分配
+			off := c.tinyoffset
+			// Align tiny pointer for required (conservative) alignment.
+			if size&7 == 0 {
+				off = alignUp(off, 8)
+			} else if sys.PtrSize == 4 && size == 12 {
+				off = alignUp(off, 8)
+			} else if size&3 == 0 {
+				off = alignUp(off, 4)
+			} else if size&1 == 0 {
+				off = alignUp(off, 2)
+			}
+			if off+size <= maxTinySize && c.tiny != 0 {
+				// The object fits into existing tiny block.
+				x = unsafe.Pointer(c.tiny + off)
+				c.tinyoffset = off + size
+				c.tinyAllocs++
+				mp.mallocing = 0
+				releasem(mp)
+				return x
+			}
+			// Allocate a new maxTinySize block.
+			span = c.alloc[tinySpanClass]
+			v := nextFreeFast(span)
+			if v == 0 {
+				v, span, shouldhelpgc = c.nextFree(tinySpanClass)
+			}
+			x = unsafe.Pointer(v)
+			(*[2]uint64)(x)[0] = 0
+			(*[2]uint64)(x)[1] = 0
+			// See if we need to replace the existing tiny block with the new one
+			// based on amount of remaining free space.
+			if size < c.tinyoffset || c.tiny == 0 {
+				c.tiny = uintptr(x)
+				c.tinyoffset = size
+			}
+			size = maxTinySize
+		} else {
+			// 小对象分配
+			var sizeclass uint8
+			// 这里是根据需要分配的大小获取对应的classid
+			if size <= smallSizeMax-8 {
+				// 表中小于1024的，按8为最小单位分割（即最小增长）
+				sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]
+			} else {
+				// 大于1024的，按128字节为分割
+				sizeclass = size_to_class128[divRoundUp(size-smallSizeMax, largeSizeDiv)]
+			}
+			// classid对应的对象大小
+			size = uintptr(class_to_size[sizeclass])
+			// 获取在mcache中的对应的span
+			spc := makeSpanClass(sizeclass, noscan)
+			span = c.alloc[spc]
+			// 获取当前span的空位
+			v := nextFreeFast(span)
+			if v == 0 {
+				// 
+				v, span, shouldhelpgc = c.nextFree(spc)
+			}
+			x = unsafe.Pointer(v)
+			if needzero && span.needzero != 0 {
+				memclrNoHeapPointers(unsafe.Pointer(v), size)
+			}
+		}
+	} else {
+		// 大对象分配
+		shouldhelpgc = true
+		span = c.allocLarge(size, needzero, noscan)
+		span.freeindex = 1
+		span.allocCount = 1
+		x = unsafe.Pointer(span.base())
+		size = span.elemsize
+	}
 
-	// Cache of the allocBits at freeindex. allocCache is shifted
-	// such that the lowest bit corresponds to the bit freeindex.
-	// allocCache holds the complement of allocBits, thus allowing
-	// ctz (count trailing zero) to use it directly.
-	// allocCache may contain bits beyond s.nelems; the caller must ignore
-	// these.
-	allocCache uint64
+	var scanSize uintptr
+	if !noscan {
+		if typ == deferType {
+			dataSize = unsafe.Sizeof(_defer{})
+		}
+		heapBitsSetType(uintptr(x), size, dataSize, typ)
+		if dataSize > typ.size {
+			// Array allocation. If there are any
+			// pointers, GC has to scan to the last
+			// element.
+			if typ.ptrdata != 0 {
+				scanSize = dataSize - typ.size + typ.ptrdata
+			}
+		} else {
+			scanSize = typ.ptrdata
+		}
+		c.scanAlloc += scanSize
+	}
 
-	allocBits  *gcBits // 内存分配详情
-	gcmarkBits *gcBits // gc标记
+	publicationBarrier()
+	if gcphase != _GCoff {
+		gcmarknewobject(span, uintptr(x), size, scanSize)
+	}
 
-	// sweep generation:
-	// if sweepgen == h->sweepgen - 2, the span needs sweeping
-	// if sweepgen == h->sweepgen - 1, the span is currently being swept
-	// if sweepgen == h->sweepgen, the span is swept and ready to use
-	// if sweepgen == h->sweepgen + 1, the span was cached before sweep began and is still cached, and needs sweeping
-	// if sweepgen == h->sweepgen + 3, the span was swept and then cached and is still cached
-	// h->sweepgen is incremented by 2 after every GC
-	sweepgen    uint32
+	if raceenabled {
+		racemalloc(x, size)
+	}
 
-	divMul      uint16        // for divide by elemsize - divMagic.mul
-	baseMask    uint16        // if non-0, elemsize is a power of 2, & this will get object allocation base
-	allocCount  uint16        // 已经分配的对象数量
-	spanclass   spanClass     // class对象id
-	state       mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
-	needzero    uint8         // needs to be zeroed before allocation
-	divShift    uint8         // for divide by elemsize - divMagic.shift
-	divShift2   uint8         // for divide by elemsize - divMagic.shift2
-	elemsize    uintptr       // class对象大小或块内存大小（class == 0）
-	limit       uintptr       // 内存块尾地址 = startAddr + npages*8k
-	speciallock mutex         // guards specials list
-	specials    *special      // linked list of special records sorted by offset.
+	if msanenabled {
+		msanmalloc(x, size)
+	}
+
+	mp.mallocing = 0
+	releasem(mp)
+
+	if debug.malloc {
+		if debug.allocfreetrace != 0 {
+			tracealloc(x, size, typ)
+		}
+
+		if inittrace.active && inittrace.id == getg().goid {
+			// Init functions are executed sequentially in a single Go routine.
+			inittrace.bytes += uint64(size)
+		}
+	}
+
+	if rate := MemProfileRate; rate > 0 {
+		if rate != 1 && size < c.nextSample {
+			c.nextSample -= size
+		} else {
+			mp := acquirem()
+			profilealloc(mp, x, size)
+			releasem(mp)
+		}
+	}
+
+	if assistG != nil {
+		// Account for internal fragmentation in the assist
+		// debt now that we know it.
+		assistG.gcAssistBytes -= int64(size - dataSize)
+	}
+
+	if shouldhelpgc {
+		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+			gcStart(t)
+		}
+	}
+
+	return x
 }
 ```
