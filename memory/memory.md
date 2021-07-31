@@ -1,4 +1,12 @@
 # memory
+TODO:
+1. mspan如何管理内存的 (down)
+2. 关于mspan结构体的分配
+3. span内存块是如何管理的
+4. span内存块是如何分配的
+5. mcentral是什么
+6. L1 L2 内存分级是什么
+7. 页是如何申请 和 管理的
 
 ## mspan
 `mspan` 是小对象分配内存的管理者。  
@@ -206,29 +214,18 @@ type mcache struct {
     // The following members are accessed on every malloc,
     // so they are grouped here for better caching.
     nextSample uintptr // 分配这么多内存后 触发 内存采样 这个数字是一个随机数字符合泊松分布（注释说的）
-    scanAlloc  uintptr // bytes of scannable heap allocated
+    scanAlloc  uintptr // 需要扫描的内存的大小
 
-    // Allocator cache for tiny objects w/o pointers.
-    // See "Tiny allocator" comment in malloc.go.
-
-    // tiny points to the beginning of the current tiny block, or
-    // nil if there is no current tiny block.
-    //
-    // tiny is a heap pointer. Since mcache is in non-GC'd memory,
-    // we handle it by clearing it in releaseAll during mark
-    // termination.
-    //
-    // tinyAllocs is the number of tiny allocations performed
-    // by the P that owns this mcache.
-    tiny       uintptr
-    tinyoffset uintptr
-    tinyAllocs uintptr
+    // 微小对象分配相关
+    tiny       uintptr // tiny块 16字节 从class2 noscan 的span中取的一个槽
+    tinyoffset uintptr // 当前tiny已被分配的内存位移
+    tinyAllocs uintptr // 微小对象分配次数
 
     // The rest is not accessed on every malloc.
 
     alloc [numSpanClasses]*mspan // p本地管理的mspan，大小168
 
-    stackcache [_NumStackOrders]stackfreelist
+    stackcache [_NumStackOrders]stackfreelist // 栈分配相关
 
     // flushGen indicates the sweepgen during which this mcache
     // was last flushed. If flushGen != mheap_.sweepgen, the spans
@@ -263,4 +260,12 @@ func allocmcache() *mcache {
     return c
 }
 ```
-`mspan` 的创建会在创建对应 `class` 的时候判断 `mcache` 上的对应的 `mspan` 是否为空或者已满。然后去 `mcentral` 中请求一个 `span`
+`mspan` 的创建会在创建对应 `class` 的时候判断 `mcache` 上的对应的 `mspan` 是否为空或者已满。然后去 `mcentral` 中请求一个 `span`  
+### 微小对象分配
+`mcache` 对 `mspan` 仅仅是持有独一份的指针，防止多线程并发竞争需要加锁。当它也没有时继续向 `mcentral` 请求一个，我们这里就不在更多分析如何管理 `mspan`，后面会分析 `mspan` 是如何分配的。  
+值得一提的是 `mcache` 有一个微小对象分配逻辑。在 `mallocgc` 函数中可以看到微小对象分配的详细情况，这里简单介绍一下：  
+1. 当分配微小对象时（小于16字节并且为`noscan`），检查 `tiny` 字段，如果为空，去 `class2 noscan` 找一个 `mspan` 即16字节大小的内存块给tiny，并将所需的内存 `size` 分配给用户，此时 `tinyoffset` 为已分配的内存大小 `size`  
+2. 若 `tiny` 字段不为空，则根据要分配的内存大小 `size`，对 `tinyoffset` 进行一个内存对齐，如果剩下的内存够放，则放进去，否则重复第一步
+
+### 栈内存分配
+TODO：后面再看
