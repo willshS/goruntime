@@ -21,171 +21,171 @@
 我们可以从 `slice`、`map`、`chan` 等实现中看到，申请内存使用的函数都是 `mallocgc` ：
 ```
 func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
-	if gcphase == _GCmarktermination {
-		throw("mallocgc called with gcphase == _GCmarktermination")
-	}
+    if gcphase == _GCmarktermination {
+        throw("mallocgc called with gcphase == _GCmarktermination")
+    }
 
-	if size == 0 {
-		return unsafe.Pointer(&zerobase)
-	}
+    if size == 0 {
+        return unsafe.Pointer(&zerobase)
+    }
 
-	// Set mp.mallocing to keep from being preempted by GC.
-	mp := acquirem()
-	mp.mallocing = 1
+    // Set mp.mallocing to keep from being preempted by GC.
+    mp := acquirem()
+    mp.mallocing = 1
 
-	shouldhelpgc := false
-	dataSize := size
-	c := getMCache()
-	if c == nil {
-		throw("mallocgc called without a P or outside bootstrapping")
-	}
-	var span *mspan
-	var x unsafe.Pointer
-	noscan := typ == nil || typ.ptrdata == 0
-	if size <= maxSmallSize {
-		if noscan && size < maxTinySize {
-			// tiny 分配
-			off := c.tinyoffset
-			// Align tiny pointer for required (conservative) alignment.
-			if size&7 == 0 {
-				off = alignUp(off, 8)
-			} else if sys.PtrSize == 4 && size == 12 {
-				off = alignUp(off, 8)
-			} else if size&3 == 0 {
-				off = alignUp(off, 4)
-			} else if size&1 == 0 {
-				off = alignUp(off, 2)
-			}
-			if off+size <= maxTinySize && c.tiny != 0 {
-				// The object fits into existing tiny block.
-				x = unsafe.Pointer(c.tiny + off)
-				c.tinyoffset = off + size
-				c.tinyAllocs++
-				mp.mallocing = 0
-				releasem(mp)
-				return x
-			}
-			// Allocate a new maxTinySize block.
-			span = c.alloc[tinySpanClass]
-			v := nextFreeFast(span)
-			if v == 0 {
-				v, span, shouldhelpgc = c.nextFree(tinySpanClass)
-			}
-			x = unsafe.Pointer(v)
-			(*[2]uint64)(x)[0] = 0
-			(*[2]uint64)(x)[1] = 0
-			// See if we need to replace the existing tiny block with the new one
-			// based on amount of remaining free space.
-			if size < c.tinyoffset || c.tiny == 0 {
-				c.tiny = uintptr(x)
-				c.tinyoffset = size
-			}
-			size = maxTinySize
-		} else {
-			// 小对象分配
-			var sizeclass uint8
-			// 这里是根据需要分配的大小获取对应的classid
-			if size <= smallSizeMax-8 {
-				// 表中小于1024的，按8为最小单位分割（即最小增长）
-				sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]
-			} else {
-				// 大于1024的，按128字节为分割
-				sizeclass = size_to_class128[divRoundUp(size-smallSizeMax, largeSizeDiv)]
-			}
-			// classid对应的对象大小
-			size = uintptr(class_to_size[sizeclass])
-			// 获取在mcache中的对应的span
-			spc := makeSpanClass(sizeclass, noscan)
-			span = c.alloc[spc]
-			// 获取当前span的空位
-			v := nextFreeFast(span)
-			if v == 0 {
-				// 
-				v, span, shouldhelpgc = c.nextFree(spc)
-			}
-			x = unsafe.Pointer(v)
-			if needzero && span.needzero != 0 {
-				memclrNoHeapPointers(unsafe.Pointer(v), size)
-			}
-		}
-	} else {
-		// 大对象分配
-		shouldhelpgc = true
-		span = c.allocLarge(size, needzero, noscan)
-		span.freeindex = 1
-		span.allocCount = 1
-		x = unsafe.Pointer(span.base())
-		size = span.elemsize
-	}
+    shouldhelpgc := false
+    dataSize := size
+    c := getMCache()
+    if c == nil {
+        throw("mallocgc called without a P or outside bootstrapping")
+    }
+    var span *mspan
+    var x unsafe.Pointer
+    noscan := typ == nil || typ.ptrdata == 0
+    if size <= maxSmallSize {
+        if noscan && size < maxTinySize {
+            // tiny 分配
+            off := c.tinyoffset
+            // Align tiny pointer for required (conservative) alignment.
+            if size&7 == 0 {
+                off = alignUp(off, 8)
+            } else if sys.PtrSize == 4 && size == 12 {
+                off = alignUp(off, 8)
+            } else if size&3 == 0 {
+                off = alignUp(off, 4)
+            } else if size&1 == 0 {
+                off = alignUp(off, 2)
+            }
+            if off+size <= maxTinySize && c.tiny != 0 {
+                // The object fits into existing tiny block.
+                x = unsafe.Pointer(c.tiny + off)
+                c.tinyoffset = off + size
+                c.tinyAllocs++
+                mp.mallocing = 0
+                releasem(mp)
+                return x
+            }
+            // Allocate a new maxTinySize block.
+            span = c.alloc[tinySpanClass]
+            v := nextFreeFast(span)
+            if v == 0 {
+                v, span, shouldhelpgc = c.nextFree(tinySpanClass)
+            }
+            x = unsafe.Pointer(v)
+            (*[2]uint64)(x)[0] = 0
+            (*[2]uint64)(x)[1] = 0
+            // See if we need to replace the existing tiny block with the new one
+            // based on amount of remaining free space.
+            if size < c.tinyoffset || c.tiny == 0 {
+                c.tiny = uintptr(x)
+                c.tinyoffset = size
+            }
+            size = maxTinySize
+        } else {
+            // 小对象分配
+            var sizeclass uint8
+            // 这里是根据需要分配的大小获取对应的classid
+            if size <= smallSizeMax-8 {
+                // 表中小于1024的，按8为最小单位分割（即最小增长）
+                sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]
+            } else {
+                // 大于1024的，按128字节为分割
+                sizeclass = size_to_class128[divRoundUp(size-smallSizeMax, largeSizeDiv)]
+            }
+            // classid对应的对象大小
+            size = uintptr(class_to_size[sizeclass])
+            // 获取在mcache中的对应的span
+            spc := makeSpanClass(sizeclass, noscan)
+            span = c.alloc[spc]
+            // 快速获取当前span的空位
+            v := nextFreeFast(span)
+            if v == 0 {
+                // 需要重填allocCache 或 分配新的span
+                v, span, shouldhelpgc = c.nextFree(spc)
+            }
+            x = unsafe.Pointer(v)
+            if needzero && span.needzero != 0 {
+                memclrNoHeapPointers(unsafe.Pointer(v), size)
+            }
+        }
+    } else {
+        // 大对象分配
+        shouldhelpgc = true
+        span = c.allocLarge(size, needzero, noscan)
+        span.freeindex = 1
+        span.allocCount = 1
+        x = unsafe.Pointer(span.base())
+        size = span.elemsize
+    }
 
-	var scanSize uintptr
-	if !noscan {
-		if typ == deferType {
-			dataSize = unsafe.Sizeof(_defer{})
-		}
-		heapBitsSetType(uintptr(x), size, dataSize, typ)
-		if dataSize > typ.size {
-			// Array allocation. If there are any
-			// pointers, GC has to scan to the last
-			// element.
-			if typ.ptrdata != 0 {
-				scanSize = dataSize - typ.size + typ.ptrdata
-			}
-		} else {
-			scanSize = typ.ptrdata
-		}
-		c.scanAlloc += scanSize
-	}
+    var scanSize uintptr
+    if !noscan {
+        if typ == deferType {
+            dataSize = unsafe.Sizeof(_defer{})
+        }
+        heapBitsSetType(uintptr(x), size, dataSize, typ)
+        if dataSize > typ.size {
+            // Array allocation. If there are any
+            // pointers, GC has to scan to the last
+            // element.
+            if typ.ptrdata != 0 {
+                scanSize = dataSize - typ.size + typ.ptrdata
+            }
+        } else {
+            scanSize = typ.ptrdata
+        }
+        c.scanAlloc += scanSize
+    }
 
-	publicationBarrier()
-	if gcphase != _GCoff {
-		gcmarknewobject(span, uintptr(x), size, scanSize)
-	}
+    publicationBarrier()
+    if gcphase != _GCoff {
+        gcmarknewobject(span, uintptr(x), size, scanSize)
+    }
 
-	if raceenabled {
-		racemalloc(x, size)
-	}
+    if raceenabled {
+        racemalloc(x, size)
+    }
 
-	if msanenabled {
-		msanmalloc(x, size)
-	}
+    if msanenabled {
+        msanmalloc(x, size)
+    }
 
-	mp.mallocing = 0
-	releasem(mp)
+    mp.mallocing = 0
+    releasem(mp)
 
-	if debug.malloc {
-		if debug.allocfreetrace != 0 {
-			tracealloc(x, size, typ)
-		}
+    if debug.malloc {
+        if debug.allocfreetrace != 0 {
+            tracealloc(x, size, typ)
+        }
 
-		if inittrace.active && inittrace.id == getg().goid {
-			// Init functions are executed sequentially in a single Go routine.
-			inittrace.bytes += uint64(size)
-		}
-	}
+        if inittrace.active && inittrace.id == getg().goid {
+            // Init functions are executed sequentially in a single Go routine.
+            inittrace.bytes += uint64(size)
+        }
+    }
 
-	if rate := MemProfileRate; rate > 0 {
-		if rate != 1 && size < c.nextSample {
-			c.nextSample -= size
-		} else {
-			mp := acquirem()
-			profilealloc(mp, x, size)
-			releasem(mp)
-		}
-	}
+    if rate := MemProfileRate; rate > 0 {
+        if rate != 1 && size < c.nextSample {
+            c.nextSample -= size
+        } else {
+            mp := acquirem()
+            profilealloc(mp, x, size)
+            releasem(mp)
+        }
+    }
 
-	if assistG != nil {
-		// Account for internal fragmentation in the assist
-		// debt now that we know it.
-		assistG.gcAssistBytes -= int64(size - dataSize)
-	}
+    if assistG != nil {
+        // Account for internal fragmentation in the assist
+        // debt now that we know it.
+        assistG.gcAssistBytes -= int64(size - dataSize)
+    }
 
-	if shouldhelpgc {
-		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
-			gcStart(t)
-		}
-	}
+    if shouldhelpgc {
+        if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
+            gcStart(t)
+        }
+    }
 
-	return x
+    return x
 }
 ```
