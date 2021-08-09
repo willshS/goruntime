@@ -43,11 +43,12 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
     var x unsafe.Pointer
     noscan := typ == nil || typ.ptrdata == 0
     if size <= maxSmallSize {
+        // 小于16字节 并且不存在指针
         if noscan && size < maxTinySize {
             // tiny 分配
             off := c.tinyoffset
-            // Align tiny pointer for required (conservative) alignment.
-            if size&7 == 0 {
+            // 对tiny中已经存在的数据进行内存对齐，方便寻址
+            if size&7 == 0 { // 如果要存的对象是8的倍数，以8字节对齐 以下对齐同理
                 off = alignUp(off, 8)
             } else if sys.PtrSize == 4 && size == 12 {
                 off = alignUp(off, 8)
@@ -56,8 +57,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
             } else if size&1 == 0 {
                 off = alignUp(off, 2)
             }
+            // 对齐后的内存 + 要分配的内存是否大于16字节 不大于就能存进去了，相当于一个16字节的槽存了两个tiny对象
             if off+size <= maxTinySize && c.tiny != 0 {
-                // The object fits into existing tiny block.
+                // 直接给x就行
                 x = unsafe.Pointer(c.tiny + off)
                 c.tinyoffset = off + size
                 c.tinyAllocs++
@@ -65,17 +67,18 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
                 releasem(mp)
                 return x
             }
-            // Allocate a new maxTinySize block.
+            // tinySpanClass == 5
             span = c.alloc[tinySpanClass]
+            // 查找空槽
             v := nextFreeFast(span)
             if v == 0 {
                 v, span, shouldhelpgc = c.nextFree(tinySpanClass)
             }
             x = unsafe.Pointer(v)
+            // 手动内存清零
             (*[2]uint64)(x)[0] = 0
             (*[2]uint64)(x)[1] = 0
-            // See if we need to replace the existing tiny block with the new one
-            // based on amount of remaining free space.
+            // 新取出来的空槽赋值给tiny字段 这个if貌似能去掉，没什么意义
             if size < c.tinyoffset || c.tiny == 0 {
                 c.tiny = uintptr(x)
                 c.tinyoffset = size
@@ -97,7 +100,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
             // 获取在mcache中的对应的span
             spc := makeSpanClass(sizeclass, noscan)
             span = c.alloc[spc]
-            // 快速获取当前span的空位
+            // 快速获取当前span的空槽
             v := nextFreeFast(span)
             if v == 0 {
                 // 需要重填allocCache 或 分配新的span
@@ -105,6 +108,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
             }
             x = unsafe.Pointer(v)
             if needzero && span.needzero != 0 {
+                // 需要内存清零的 这里清一下
                 memclrNoHeapPointers(unsafe.Pointer(v), size)
             }
         }
