@@ -814,6 +814,7 @@ type mheap struct {
 		pad      [cpu.CacheLinePadSize - unsafe.Sizeof(mcentral{})%cpu.CacheLinePadSize]byte
 	}
 
+    // 以下是各种分配器，缓存了mspan mcache等对象，进行内存复用
 	spanalloc             fixalloc // allocator for span*
 	cachealloc            fixalloc // allocator for mcache*
 	specialfinalizeralloc fixalloc // allocator for specialfinalizer*
@@ -905,23 +906,23 @@ func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass
 	unlock(&h.lock)
 
 HaveSpan:
-	// At this point, both s != nil and base != 0, and the heap
-	// lock is no longer held. Initialize the span.
+	// 以下是初始化mspan
 	s.init(base, npages)
 	if h.allocNeedsZero(base, npages) {
 		s.needzero = 1
 	}
 	nbytes := npages * pageSize
 	if typ.manual() {
+        // 非 堆类型 内存的初始化
 		s.manualFreeList = 0
 		s.nelems = 0
 		s.limit = s.base() + s.npages*pageSize
 		s.state.set(mSpanManual)
 	} else {
-		// We must set span properties before the span is published anywhere
-		// since we're not holding the heap lock.
+		// 设置spanClass
 		s.spanclass = spanclass
 		if sizeclass := spanclass.sizeclass(); sizeclass == 0 {
+            // 特殊处理 sizeclass = 0 TODO：好像没有看到用sizeclass为0的
 			s.elemsize = nbytes
 			s.nelems = 1
 
@@ -930,6 +931,7 @@ HaveSpan:
 			s.divShift2 = 0
 			s.baseMask = 0
 		} else {
+            // 根据对象大小预定义属性
 			s.elemsize = uintptr(class_to_size[sizeclass])
 			s.nelems = nbytes / s.elemsize
 
@@ -940,34 +942,22 @@ HaveSpan:
 			s.baseMask = m.baseMask
 		}
 
-		// Initialize mark and allocation structures.
+		// 初始化内存标记相关属性
 		s.freeindex = 0
 		s.allocCache = ^uint64(0) // all 1s indicating all free.
 		s.gcmarkBits = newMarkBits(s.nelems)
 		s.allocBits = newAllocBits(s.nelems)
 
-		// It's safe to access h.sweepgen without the heap lock because it's
-		// only ever updated with the world stopped and we run on the
-		// systemstack which blocks a STW transition.
+		// 更新sweepgen
 		atomic.Store(&s.sweepgen, h.sweepgen)
 
-		// Now that the span is filled in, set its state. This
-		// is a publication barrier for the other fields in
-		// the span. While valid pointers into this span
-		// should never be visible until the span is returned,
-		// if the garbage collector finds an invalid pointer,
-		// access to the span may race with initialization of
-		// the span. We resolve this race by atomically
-		// setting the state after the span is fully
-		// initialized, and atomically checking the state in
-		// any situation where a pointer is suspect.
+		// 修改span状态 防止gc的时候扫描到的无效指针指向此span导致的竞争
+        // 这样在任何需要的场景下进行判断状态来避免并发竞争
 		s.state.set(mSpanInUse)
 	}
 
-	// Commit and account for any scavenged memory that the span now owns.
 	if scav != 0 {
-		// sysUsed all the pages that are actually available
-		// in the span since some of them might be scavenged.
+		// sysUsed
 		sysUsed(unsafe.Pointer(base), nbytes)
 		atomic.Xadd64(&memstats.heap_released, -int64(scav))
 	}
@@ -997,19 +987,11 @@ HaveSpan:
 
 	// Publish the span in various locations.
 
-	// This is safe to call without the lock held because the slots
-	// related to this span will only ever be read or modified by
-	// this thread until pointers into the span are published (and
-	// we execute a publication barrier at the end of this function
-	// before that happens) or pageInUse is updated.
+	// span存到mheap的arena
 	h.setSpans(s.base(), npages, s)
 
 	if !typ.manual() {
-		// Mark in-use span in arena page bitmap.
-		//
-		// This publishes the span to the page sweeper, so
-		// it's imperative that the span be completely initialized
-		// prior to this line.
+		// 将span的标记信息加入到arena
 		arena, pageIdx, pageMask := pageIndexOf(s.base())
 		atomic.Or8(&arena.pageInUse[pageIdx], pageMask)
 
