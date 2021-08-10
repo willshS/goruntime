@@ -12,7 +12,7 @@ type p struct {
     sysmontick  sysmontick // last tick observed by sysmon
     m           muintptr   // P绑定的M
     mcache      *mcache  // P的本地缓存
-    pcache      pageCache
+    pcache      pageCache // P的本地页缓存
 
     // defer相关
     deferpool    [5][]*_defer // pool of available defer structs of different sizes (see panic.go)
