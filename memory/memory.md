@@ -743,41 +743,16 @@ type mheap struct {
 	// This is accessed atomically.
 	reclaimCredit uintptr
 
-	// arenas is the heap arena map. It points to the metadata for
-	// the heap for every arena frame of the entire usable virtual
-	// address space.
-	//
-	// Use arenaIndex to compute indexes into this array.
-	//
-	// For regions of the address space that are not backed by the
-	// Go heap, the arena map contains nil.
-	//
-	// Modifications are protected by mheap_.lock. Reads can be
-	// performed without locking; however, a given entry can
-	// transition from nil to non-nil at any time when the lock
-	// isn't held. (Entries never transitions back to nil.)
-	//
-	// In general, this is a two-level mapping consisting of an L1
-	// map and possibly many L2 maps. This saves space when there
-	// are a huge number of arena frames. However, on many
-	// platforms (even 64-bit), arenaL1Bits is 0, making this
-	// effectively a single-level map. In this case, arenas[0]
-	// will never be nil.
+	// 所有的arenas
 	arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena
 
-	// heapArenaAlloc is pre-reserved space for allocating heapArena
-	// objects. This is only used on 32-bit, where we pre-reserve
-	// this space to avoid interleaving it with the heap itself.
+	// 64位未使用
 	heapArenaAlloc linearAlloc
 
-	// arenaHints is a list of addresses at which to attempt to
-	// add more heap arenas. This is initially populated with a
-	// set of general hint addresses, and grown with the bounds of
-	// actual heap arena ranges.
+	// 向操作系统申请内存的时候的起始地址
 	arenaHints *arenaHint
 
-	// arena is a pre-reserved space for allocating heap arenas
-	// (the actual arenas). This is only used on 32-bit.
+	// 64位未使用
 	arena linearAlloc
 
 	// allArenas is the arenaIndex of every mapped arena. This can
@@ -1005,5 +980,118 @@ HaveSpan:
 
 	return s
 }
+```
+到此上一个主角 `mspan` 以及相关数据结构基本明白了，而 `mspan` 的来源也清晰了，是通过 `page` 来组成的，那么 `page` 是如何来的，以及是如何管理的。  
+**因为硬件和操作系统限制，linux amd64 分配最大内存为 1<<48，golang将内存分为一个个arena，每一个大小为64M（1<<26），因此总共可以有1<<22个arena，每一个arena具有8192个页（8192*8k=64M），然后通过字典树来映射arenas**
 
+`mheap`是以页为基本单位来管理内存的，最上面一层是 `arena`，数据结构是以下定义：
+```
+type heapArena struct {
+	// 当前heapArena的位图表示 2M
+	bitmap [heapArenaBitmapBytes]byte
+
+	// 这里的mspan每一个都是存了一个页，是为了管理页，与上面的不同
+    // pagesPerArena = 8192 因此一个heapArena管理的内存大小是8192*8192 = 64M
+	spans [pagesPerArena]*mspan
+
+	// 表示哪个页在使用，每一位表示一个页
+	pageInUse [pagesPerArena / 8]uint8
+
+	// 表示哪个页上面有对象被标记
+	pageMarks [pagesPerArena / 8]uint8
+
+	// pageSpecials is a bitmap that indicates which spans have
+	// specials (finalizers or other).
+	pageSpecials [pagesPerArena / 8]uint8
+
+	// debug模式调试使用
+	checkmarks *checkmarksMap
+
+	// zeroedBase marks the first byte of the first page in this
+	// arena which hasn't been used yet and is therefore already
+	// zero. zeroedBase is relative to the arena base.
+	// Increases monotonically until it hits heapArenaBytes.
+	//
+	// This field is sufficient to determine if an allocation
+	// needs to be zeroed because the page allocator follows an
+	// address-ordered first-fit policy.
+	//
+	// Read atomically and written with an atomic CAS.
+	zeroedBase uintptr
+}
+```
+
+
+```
+func (h *mheap) grow(npage uintptr) bool {
+	assertLockHeld(&h.lock)
+
+	// 申请512整数倍的页数，也就是最少4M
+	ask := alignUp(npage, pallocChunkPages) * pageSize
+
+	totalGrowth := uintptr(0)
+	end := h.curArena.base + ask
+	nBase := alignUp(end, physPageSize)
+	if nBase > h.curArena.end || /* overflow */ end < h.curArena.base {
+        // 当前arena空间不够
+		av, asize := h.sysAlloc(ask)
+		if av == nil {
+			print("runtime: out of memory: cannot allocate ", ask, "-byte block (", memstats.heap_sys, " in use)\n")
+			return false
+		}
+        
+		if uintptr(av) == h.curArena.end {
+			// The new space is contiguous with the old
+			// space, so just extend the current space.
+			h.curArena.end = uintptr(av) + asize
+		} else {
+			// The new space is discontiguous. Track what
+			// remains of the current space and switch to
+			// the new space. This should be rare.
+			if size := h.curArena.end - h.curArena.base; size != 0 {
+				h.pages.grow(h.curArena.base, size)
+				totalGrowth += size
+			}
+			// Switch to the new space.
+			h.curArena.base = uintptr(av)
+			h.curArena.end = uintptr(av) + asize
+		}
+
+		// The memory just allocated counts as both released
+		// and idle, even though it's not yet backed by spans.
+		//
+		// The allocation is always aligned to the heap arena
+		// size which is always > physPageSize, so its safe to
+		// just add directly to heap_released.
+		atomic.Xadd64(&memstats.heap_released, int64(asize))
+		stats := memstats.heapStats.acquire()
+		atomic.Xaddint64(&stats.released, int64(asize))
+		memstats.heapStats.release()
+
+		// Recalculate nBase.
+		// We know this won't overflow, because sysAlloc returned
+		// a valid region starting at h.curArena.base which is at
+		// least ask bytes in size.
+		nBase = alignUp(h.curArena.base+ask, physPageSize)
+	}
+
+	// Grow into the current arena.
+	v := h.curArena.base
+	h.curArena.base = nBase
+	h.pages.grow(v, nBase-v)
+	totalGrowth += nBase - v
+
+	// We just caused a heap growth, so scavenge down what will soon be used.
+	// By scavenging inline we deal with the failure to allocate out of
+	// memory fragments by scavenging the memory fragments that are least
+	// likely to be re-used.
+	if retained := heapRetained(); retained+uint64(totalGrowth) > h.scavengeGoal {
+		todo := totalGrowth
+		if overage := uintptr(retained + uint64(totalGrowth) - h.scavengeGoal); todo > overage {
+			todo = overage
+		}
+		h.pages.scavenge(todo, false)
+	}
+	return true
+}
 ```
