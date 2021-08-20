@@ -8,6 +8,20 @@ TODO:
 6. L1 L2 内存分级是什么
 7. 页是如何申请 和 管理的
 
+**总结一下内存分配的整个流程：再往下看就比较容易看懂**
+1. **用户申请内存，获取当前`G`的`P`上的`mcache`，根据用户需要的内存大小查找`mcache`上对应的`mspan`，从`mspan`上获取一个空槽（满足用户所需内存的地址空间），此时无需加锁**
+2. **`mspan`上没有空槽了，`mcache`去`mcentral`申请一个`mspan`**
+    1. **`mcentral` 根据对象大小有多个`mcentral`,每个`mcentral`代表一种小对象的`mspan`管理中心**
+    2. **`mcentral` 有4个`mspan`的集合，分别表示有空位的、没空位的，清扫后的、未清扫的，2*2=4种，每个集合有一个切片存放多个`spanSetBlock`**
+    3. **一个`spanSetBlock`可以存放512个`mspan`**
+    4. **`mcentral` 中的这4个集合提供类似队列`pop/push`操作，通过读写下标和原子操作实现无锁队列，此时也无需加锁**
+3. **`mcache`用完的`mspan`也会给`mcentral`去管理，到此`mspan`这个存放数据的基本单位的管理就这么多了**
+4. **`mcentral`没有`mspan`可以给`mcache`用了，就要去`mheap`申请（这个时候就必须全局一把大锁了）：**
+    1. **`mheap`检查是否有些内存可以复用，如果没有检查一下`pageAlloc`管理的内存是否有空闲内存**
+    2. **如果`pageAlloc`有空闲内存，拿一些内存给到`P`的`pageCache`（全局大锁），然后通过`P`本地的`pageCache`分配一个`mspan`（无需锁），细化锁的粒度**
+    3. **如果`pageAlloc`也没有空闲内存了，`mheap`向`curArena`要一块4M对齐的内存（意思是最少4M），`curArena`是上一次向操作系统申请内存的所有内存**
+5. **`curArena`也没有内存了，向操作系统申请一块64M对齐的内存（最少64M），将这块内存信息保存到`curArena`中，然后根据用户需要的内存大小以4M对齐，给`pageAlloc`管理，更新`curArena`的信息，相当于申请下来的内存根据用户需求的量给`pageAlloc`管理，多出来的内存还放在`curArena`中**
+
 ## mspan
 `mspan` 是小对象分配内存的管理者。  
 
@@ -114,36 +128,36 @@ func nextFreeFast(s *mspan) gclinkptr {
 以上就是快速查找空槽算法，当我们分配了`63`个槽的时候，因为 `allocCache` 只有 `64bit` 的原因，会触发内存重新填充 `allocCache` 的逻辑：
 ```
 func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
-	s = c.alloc[spc]
-	shouldhelpgc = false
+    s = c.alloc[spc]
+    shouldhelpgc = false
     // 重新填充allocCache
-	freeIndex := s.nextFreeIndex()
-	if freeIndex == s.nelems {
-		// mspan真的满了
-		if uintptr(s.allocCount) != s.nelems {
-			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
-			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
-		}
+    freeIndex := s.nextFreeIndex()
+    if freeIndex == s.nelems {
+        // mspan真的满了
+        if uintptr(s.allocCount) != s.nelems {
+            println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
+            throw("s.allocCount != s.nelems && freeIndex == s.nelems")
+        }
         // mcache根据spanClass 重新请求mspan
-		c.refill(spc)
-		shouldhelpgc = true
+        c.refill(spc)
+        shouldhelpgc = true
         // 这里就是新的mspan了
-		s = c.alloc[spc]
+        s = c.alloc[spc]
 
-		freeIndex = s.nextFreeIndex()
-	}
+        freeIndex = s.nextFreeIndex()
+    }
     // 检查新的mspan对不对
-	if freeIndex >= s.nelems {
-		throw("freeIndex is not valid")
-	}
+    if freeIndex >= s.nelems {
+        throw("freeIndex is not valid")
+    }
     // 返回新的mspan中的槽的地址
-	v = gclinkptr(freeIndex*s.elemsize + s.base())
-	s.allocCount++
-	if uintptr(s.allocCount) > s.nelems {
-		println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
-		throw("s.allocCount > s.nelems")
-	}
-	return
+    v = gclinkptr(freeIndex*s.elemsize + s.base())
+    s.allocCount++
+    if uintptr(s.allocCount) > s.nelems {
+        println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
+        throw("s.allocCount > s.nelems")
+    }
+    return
 }
 
 func (s *mspan) nextFreeIndex() uintptr {
@@ -297,61 +311,61 @@ func allocmcache() *mcache {
 ```
 // 上面mcache没有mspan的时候，会调用refill重新申请一个mspan
 func (c *mcache) refill(spc spanClass) {
-	s := c.alloc[spc]
+    s := c.alloc[spc]
 
-	if uintptr(s.allocCount) != s.nelems {
-		throw("refill of span with free space remaining")
-	}
-	if s != &emptymspan {
-		// Mark this span as no longer cached.
-		if s.sweepgen != mheap_.sweepgen+3 {
-			throw("bad sweepgen in refill")
-		}
-		mheap_.central[spc].mcentral.uncacheSpan(s)
-	}
+    if uintptr(s.allocCount) != s.nelems {
+        throw("refill of span with free space remaining")
+    }
+    if s != &emptymspan {
+        // Mark this span as no longer cached.
+        if s.sweepgen != mheap_.sweepgen+3 {
+            throw("bad sweepgen in refill")
+        }
+        mheap_.central[spc].mcentral.uncacheSpan(s)
+    }
 
-	// 从mcentral中获取一个新的mspan
-	s = mheap_.central[spc].mcentral.cacheSpan()
-	if s == nil {
-		throw("out of memory")
-	}
+    // 从mcentral中获取一个新的mspan
+    s = mheap_.central[spc].mcentral.cacheSpan()
+    if s == nil {
+        throw("out of memory")
+    }
 
-	if uintptr(s.allocCount) == s.nelems {
-		throw("span has no free space")
-	}
+    if uintptr(s.allocCount) == s.nelems {
+        throw("span has no free space")
+    }
 
-	// 此次gc不清扫，下次gc再清扫
-	s.sweepgen = mheap_.sweepgen + 3
+    // 此次gc不清扫，下次gc再清扫
+    s.sweepgen = mheap_.sweepgen + 3
 
-	// 假设新取的mspan中的空闲槽都会被分配出去，等还回来的时候再调整
-	stats := memstats.heapStats.acquire()
-	atomic.Xadduintptr(&stats.smallAllocCount[spc.sizeclass()], uintptr(s.nelems)-uintptr(s.allocCount))
-	memstats.heapStats.release()
+    // 假设新取的mspan中的空闲槽都会被分配出去，等还回来的时候再调整
+    stats := memstats.heapStats.acquire()
+    atomic.Xadduintptr(&stats.smallAllocCount[spc.sizeclass()], uintptr(s.nelems)-uintptr(s.allocCount))
+    memstats.heapStats.release()
 
-	// heap_live同上
-	usedBytes := uintptr(s.allocCount) * s.elemsize
-	atomic.Xadd64(&memstats.heap_live, int64(s.npages*pageSize)-int64(usedBytes))
+    // heap_live同上
+    usedBytes := uintptr(s.allocCount) * s.elemsize
+    atomic.Xadd64(&memstats.heap_live, int64(s.npages*pageSize)-int64(usedBytes))
 
-	// 如果是微小对象的话 把已经分配的微小对象数量刷进内存状态中
-	if spc == tinySpanClass {
-		atomic.Xadd64(&memstats.tinyallocs, int64(c.tinyAllocs))
-		c.tinyAllocs = 0
-	}
+    // 如果是微小对象的话 把已经分配的微小对象数量刷进内存状态中
+    if spc == tinySpanClass {
+        atomic.Xadd64(&memstats.tinyallocs, int64(c.tinyAllocs))
+        c.tinyAllocs = 0
+    }
 
-	// 更新堆扫描size
-	atomic.Xadd64(&memstats.heap_scan, int64(c.scanAlloc))
-	c.scanAlloc = 0
+    // 更新堆扫描size
+    atomic.Xadd64(&memstats.heap_scan, int64(c.scanAlloc))
+    c.scanAlloc = 0
 
-	if trace.enabled {
-		// heap_live changed.
-		traceHeapAlloc()
-	}
-	if gcBlackenEnabled != 0 {
-		// heap_live and heap_scan changed.
-		gcController.revise()
-	}
+    if trace.enabled {
+        // heap_live changed.
+        traceHeapAlloc()
+    }
+    if gcBlackenEnabled != 0 {
+        // heap_live and heap_scan changed.
+        gcController.revise()
+    }
     // 更新mcache中的mspan
-	c.alloc[spc] = s
+    c.alloc[spc] = s
 }
 ```
 
@@ -368,730 +382,896 @@ TODO：后面再看
 `mcentral` 是更上一层的管理 `mspan` 的数据结构，也是 `mcache` 中的内存块的来源。
 ```
 type mcentral struct {
-	spanclass spanClass // 这里可以看到 mcentral 对应 mcache 的136个span，通过spanclass来进行管理
-	partial [2]spanSet // list of spans with a free object 一个是已经清扫的spanset 一个是尚未清扫的spanset
-	full    [2]spanSet // list of spans with no free objects
+    spanclass spanClass // 这里可以看到 mcentral 对应 mcache 的136个span，通过spanclass来进行管理
+    partial [2]spanSet // list of spans with a free object 一个是已经清扫的spanset 一个是尚未清扫的spanset
+    full    [2]spanSet // list of spans with no free objects
 }
 
 type spanSet struct {
-	spineLock mutex
-	spine     unsafe.Pointer // *[N]*spanSetBlock, accessed atomically 存储的是切片指针，切片中是spanSetBlock的指针
-	spineLen  uintptr        // Spine array length, 数组长度
-	spineCap  uintptr        // Spine array cap, 数组容量
+    spineLock mutex
+    spine     unsafe.Pointer // *[N]*spanSetBlock, accessed atomically 存储的是切片指针，切片中是spanSetBlock的指针
+    spineLen  uintptr        // Spine array length, 数组长度
+    spineCap  uintptr        // Spine array cap, 数组容量
 
-	index headTailIndex    // spine的下标
+    index headTailIndex    // spine的下标
 }
 
 type spanSetBlock struct {
-	lfnode
-	popped uint32
+    lfnode
+    popped uint32
 
-	// 大小4k 512*8字节指针长度
-	spans [spanSetBlockEntries]*mspan  // 512长度的mspan数组
+    // 大小4k 512*8字节指针长度
+    spans [spanSetBlockEntries]*mspan  // 512长度的mspan数组
 }
 ```
-`mcentral` 也是通过 `spanClass` 分类管理，每一个 `mcentral` 中都存储了多个 `mspan`。这些 `mspan` 被分为4块，每一块就是一个 `spanSet` ，分别为：有空闲的并已经清扫的、有空闲的并尚未清扫的、无空闲的并已经清扫的，无空闲的并尚未清扫的。这里对 `spanSet` 的存取是通过一下函数：
+`mcentral` 也是通过 `spanClass` 分类管理，每一个 `mcentral` 中都存储了多个 `mspan`。这些 `mspan` 被分为4块，每一块就是一个 `spanSet` ，分别为：有空闲的并已经清扫的、有空闲的并尚未清扫的、无空闲的并已经清扫的，无空闲的并尚未清扫的。这里对 `spanSet` 的存取是通过以下函数：
 ```
 func (c *mcentral) partialUnswept(sweepgen uint32) *spanSet {
-	return &c.partial[1-sweepgen/2%2]
+    return &c.partial[1-sweepgen/2%2]
 }
 
 func (c *mcentral) partialSwept(sweepgen uint32) *spanSet {
-	return &c.partial[sweepgen/2%2]
+    return &c.partial[sweepgen/2%2]
 }
 ```
 每次 `mheap.sweepgen` 在gc的时候+2，因此每次gc后，清扫与未清扫的 `spanSet` 自然交换。
 
 ### 获取mspan
+当 `mcache` 中没有 `span` 可用，会从 `mcentral` 中申请内存（单位还是`mspan`，可能为一页或多页）：
 ```
 func (c *mcentral) cacheSpan() *mspan {
-	// Deduct credit for this span allocation and sweep if necessary.
-	spanBytes := uintptr(class_to_allocnpages[c.spanclass.sizeclass()]) * _PageSize
-	deductSweepCredit(spanBytes, 0)
+    // Deduct credit for this span allocation and sweep if necessary.
+    spanBytes := uintptr(class_to_allocnpages[c.spanclass.sizeclass()]) * _PageSize
+    deductSweepCredit(spanBytes, 0)
 
-	sg := mheap_.sweepgen
+    sg := mheap_.sweepgen
 
-	traceDone := false
-	if trace.enabled {
-		traceGCSweepStart()
-	}
+    traceDone := false
+    if trace.enabled {
+        traceGCSweepStart()
+    }
 
-	// 这里不能无限制的找free span，如果超过100个 新分配一个span
-	spanBudget := 100
+    // 这里不能无限制的找free span，如果超过100个 新分配一个span
+    spanBudget := 100
 
-	var s *mspan
+    var s *mspan
 
-	// 去已经清扫的 有空闲的 spanset里面取一个
-	if s = c.partialSwept(sg).pop(); s != nil {
-		goto havespan
-	}
+    // 去已经清扫的 有空闲的 spanset里面取一个
+    if s = c.partialSwept(sg).pop(); s != nil {
+        goto havespan
+    }
 
-	// 尝试去未清扫的 有空闲的 spanset里面取一个
-	for ; spanBudget >= 0; spanBudget-- {
-		s = c.partialUnswept(sg).pop()
-		if s == nil {
-			break
-		}
-		if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
-			// 获取span的所有权，进行清扫并使用
-			s.sweep(true)
-			goto havespan
-		}
-		// 说明有其它人获取了这个span的所有权正在清扫
-	}
-	// 尝试去没有空闲的 未清扫的 spanset里面取一个
-	for ; spanBudget >= 0; spanBudget-- {
-		s = c.fullUnswept(sg).pop()
-		if s == nil {
-			break
-		}
-		if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
-			// 与上面相同
-			s.sweep(true)
-			// 检查清扫结束后 是否有空槽
-			freeIndex := s.nextFreeIndex()
-			if freeIndex != s.nelems {
-				s.freeindex = freeIndex
-				goto havespan
-			}
-			// 清扫结束后还是没有空槽 放入没有空闲的 已经清扫的 spanset
-			c.fullSwept(sg).push(s)
-		}
-		// 跟partialUnswept相同，没有成功拿到所有权
-	}
-	if trace.enabled {
-		traceGCSweepDone()
-		traceDone = true
-	}
+    // 尝试去未清扫的 有空闲的 spanset里面取一个
+    for ; spanBudget >= 0; spanBudget-- {
+        s = c.partialUnswept(sg).pop()
+        if s == nil {
+            break
+        }
+        if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
+            // 获取span的所有权，进行清扫并使用
+            s.sweep(true)
+            goto havespan
+        }
+        // 说明有其它人获取了这个span的所有权正在清扫
+    }
+    // 尝试去没有空闲的 未清扫的 spanset里面取一个
+    for ; spanBudget >= 0; spanBudget-- {
+        s = c.fullUnswept(sg).pop()
+        if s == nil {
+            break
+        }
+        if atomic.Load(&s.sweepgen) == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
+            // 与上面相同
+            s.sweep(true)
+            // 检查清扫结束后 是否有空槽
+            freeIndex := s.nextFreeIndex()
+            if freeIndex != s.nelems {
+                s.freeindex = freeIndex
+                goto havespan
+            }
+            // 清扫结束后还是没有空槽 放入没有空闲的 已经清扫的 spanset
+            c.fullSwept(sg).push(s)
+        }
+        // 跟partialUnswept相同，没有成功拿到所有权
+    }
+    if trace.enabled {
+        traceGCSweepDone()
+        traceDone = true
+    }
 
-	// mcentral没找到空闲的（没有空闲或者找了100个span了）  分配一个新的span
-	s = c.grow()
-	if s == nil {
+    // mcentral没找到空闲的（没有空闲或者找了100个span了）  分配一个新的span
+    s = c.grow()
+    if s == nil {
         // 没内存了？外面会throw
-		return nil
-	}
+        return nil
+    }
 
-	// 这个label表示已经有空闲槽位的span了
+    // 这个label表示已经有空闲槽位的span了
 havespan:
-	if trace.enabled && !traceDone {
-		traceGCSweepDone()
-	}
+    if trace.enabled && !traceDone {
+        traceGCSweepDone()
+    }
     // 检查span的状态
-	n := int(s.nelems) - int(s.allocCount)
-	if n == 0 || s.freeindex == s.nelems || uintptr(s.allocCount) == s.nelems {
-		throw("span has no free objects")
-	}
+    n := int(s.nelems) - int(s.allocCount)
+    if n == 0 || s.freeindex == s.nelems || uintptr(s.allocCount) == s.nelems {
+        throw("span has no free objects")
+    }
     // 重新填充mspan的allocCahce
-	freeByteBase := s.freeindex &^ (64 - 1)
-	whichByte := freeByteBase / 8
-	// Init alloc bits cache.
-	s.refillAllocCache(whichByte)
-	s.allocCache >>= s.freeindex % 64
+    freeByteBase := s.freeindex &^ (64 - 1)
+    whichByte := freeByteBase / 8
+    // Init alloc bits cache.
+    s.refillAllocCache(whichByte)
+    s.allocCache >>= s.freeindex % 64
 
-	return s
+    return s
 }
 ```
 
 ### 回收mspan
 ```
 func (c *mcentral) uncacheSpan(s *mspan) {
-	if s.allocCount == 0 {
-		throw("uncaching span but s.allocCount == 0")
-	}
+    if s.allocCount == 0 {
+        throw("uncaching span but s.allocCount == 0")
+    }
 
-	sg := mheap_.sweepgen
-	stale := s.sweepgen == sg+1
+    sg := mheap_.sweepgen
+    stale := s.sweepgen == sg+1
 
-	// 修正span的清扫标志
-	if stale {
+    // 修正span的清扫标志
+    if stale {
         // 表示此span需要清扫
-		atomic.Store(&s.sweepgen, sg-1)
-	} else {
-		// Indicate that s is no longer cached.
-		atomic.Store(&s.sweepgen, sg)
-	}
+        atomic.Store(&s.sweepgen, sg-1)
+    } else {
+        // Indicate that s is no longer cached.
+        atomic.Store(&s.sweepgen, sg)
+    }
 
-	// span放在合适的spanSet中
-	if stale {
-		// 清扫span
-		s.sweep(false)
-	} else {
+    // span放在合适的spanSet中
+    if stale {
+        // 清扫span
+        s.sweep(false)
+    } else {
         // 此次gc不需要清扫，放入相应队列，下次gc清扫
-		if int(s.nelems)-int(s.allocCount) > 0 {
-			// Put it back on the partial swept list.
-			c.partialSwept(sg).push(s)
-		} else {
-			// There's no free space and it's not stale, so put it on the
-			// full swept list.
-			c.fullSwept(sg).push(s)
-		}
-	}
+        if int(s.nelems)-int(s.allocCount) > 0 {
+            // Put it back on the partial swept list.
+            c.partialSwept(sg).push(s)
+        } else {
+            // There's no free space and it's not stale, so put it on the
+            // full swept list.
+            c.fullSwept(sg).push(s)
+        }
+    }
 }
 ```
 
 ### 申请mspan
 ```
 func (c *mcentral) grow() *mspan {
-	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
-	size := uintptr(class_to_size[c.spanclass.sizeclass()])
+    npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
+    size := uintptr(class_to_size[c.spanclass.sizeclass()])
 
     // 从堆上分配
-	s := mheap_.alloc(npages, c.spanclass, true)
-	if s == nil {
-		return nil
-	}
+    s := mheap_.alloc(npages, c.spanclass, true)
+    if s == nil {
+        return nil
+    }
 
-	// Use division by multiplication and shifts to quickly compute:
-	// n := (npages << _PageShift) / size
-	n := (npages << _PageShift) >> s.divShift * uintptr(s.divMul) >> s.divShift2
-	s.limit = s.base() + size*n
-	heapBitsForAddr(s.base()).initSpan(s)
-	return s
+    // Use division by multiplication and shifts to quickly compute:
+    // n := (npages << _PageShift) / size
+    n := (npages << _PageShift) >> s.divShift * uintptr(s.divMul) >> s.divShift2
+    s.limit = s.base() + size*n
+    heapBitsForAddr(s.base()).initSpan(s)
+    return s
 }
 ```
 
 #### spanSet
 ```
 func (b *spanSet) push(s *mspan) {
-	// 根据index，找到要存的位置
-	cursor := uintptr(b.index.incTail().tail() - 1)
+    // 根据index，找到要存的位置
+    cursor := uintptr(b.index.incTail().tail() - 1)
     // top是存在spanSet中的第几个spanSetBlock，bottom是存在spanSetBlock数组中的第几个位置
-	top, bottom := cursor/spanSetBlockEntries, cursor%spanSetBlockEntries
+    top, bottom := cursor/spanSetBlockEntries, cursor%spanSetBlockEntries
     // 获取当前spanSet的长度
-	spineLen := atomic.Loaduintptr(&b.spineLen)
-	var block *spanSetBlock
+    spineLen := atomic.Loaduintptr(&b.spineLen)
+    var block *spanSetBlock
 retry:
-	if top < spineLen {
+    if top < spineLen {
         // 长度够 直接从spanSet切片spine中的对应spanSetBlock拿出来
-		spine := atomic.Loadp(unsafe.Pointer(&b.spine))
-		blockp := add(spine, sys.PtrSize*top)
-		block = (*spanSetBlock)(atomic.Loadp(blockp))
-	} else {
-		lock(&b.spineLock)
-		// 二次检查 double check
-		spineLen = atomic.Loaduintptr(&b.spineLen)
-		if top < spineLen {
-			unlock(&b.spineLock)
-			goto retry
-		}
+        spine := atomic.Loadp(unsafe.Pointer(&b.spine))
+        blockp := add(spine, sys.PtrSize*top)
+        block = (*spanSetBlock)(atomic.Loadp(blockp))
+    } else {
+        lock(&b.spineLock)
+        // 二次检查 double check
+        spineLen = atomic.Loaduintptr(&b.spineLen)
+        if top < spineLen {
+            unlock(&b.spineLock)
+            goto retry
+        }
         // 是否需要扩容 与切片扩容类似
-		if spineLen == b.spineCap {
-			// Grow the spine.
-			newCap := b.spineCap * 2
-			if newCap == 0 {
-				newCap = spanSetInitSpineCap
-			}
+        if spineLen == b.spineCap {
+            // Grow the spine.
+            newCap := b.spineCap * 2
+            if newCap == 0 {
+                // 新的spanset 容量默认大小为256
+                newCap = spanSetInitSpineCap
+            }
             // 分配新的切片数组
-			newSpine := persistentalloc(newCap*sys.PtrSize, cpu.CacheLineSize, &memstats.gcMiscSys)
-			if b.spineCap != 0 {
-				// 旧的切片数据移动到新的切片
-				memmove(newSpine, b.spine, b.spineCap*sys.PtrSize)
-			}
-			// 更新spine
-			atomic.StorepNoWB(unsafe.Pointer(&b.spine), newSpine)
-			b.spineCap = newCap
+            newSpine := persistentalloc(newCap*sys.PtrSize, cpu.CacheLineSize, &memstats.gcMiscSys)
+            if b.spineCap != 0 {
+                // 旧的切片数据移动到新的切片
+                memmove(newSpine, b.spine, b.spineCap*sys.PtrSize)
+            }
+            // 更新spine
+            atomic.StorepNoWB(unsafe.Pointer(&b.spine), newSpine)
+            b.spineCap = newCap
 
             // 因为并发push，所以不能立即释放旧的spine
             // 根据注释 表示1TB的堆内存只用了2M，即便泄露也无所谓
             // 如果这个泄露是问题，那么可以在STW的时候进行释放旧的spine
-		}
+        }
 
-		// 分配一个spanSetBlock结构体
-		block = spanSetBlockPool.alloc()
+        // 分配一个spanSetBlock结构体
+        block = spanSetBlockPool.alloc()
 
-		// 加入到spine中
-		blockp := add(b.spine, sys.PtrSize*top)
-		// 更新即可
-		atomic.StorepNoWB(blockp, unsafe.Pointer(block))
-		atomic.Storeuintptr(&b.spineLen, spineLen+1)
-		unlock(&b.spineLock)
-	}
+        // 加入到spine中
+        blockp := add(b.spine, sys.PtrSize*top)
+        // 更新即可
+        atomic.StorepNoWB(blockp, unsafe.Pointer(block))
+        atomic.Storeuintptr(&b.spineLen, spineLen+1)
+        unlock(&b.spineLock)
+    }
 
-	// span放到spanSet中的某个spanSetBlock中对应的位置
-	atomic.StorepNoWB(unsafe.Pointer(&block.spans[bottom]), unsafe.Pointer(s))
+    // span放到spanSet中的某个spanSetBlock中对应的位置
+    atomic.StorepNoWB(unsafe.Pointer(&block.spans[bottom]), unsafe.Pointer(s))
 }
 ```
 一个 `spanSetBlock` 有一个512大小（占用内存为512*8=4k）的数组，可以表示起码（按一个`mspan`只有一个`page`来算）4M的内存。  
 一个 `spanSet` 按照长度或容量256大小（占用内存256*8=2k字节）计算，可以表示起码1G的内存（256个`spanSetBlock` * 4M）。
 ```
 func (b *spanSet) pop() *mspan {
-	var head, tail uint32
+    var head, tail uint32
 claimLoop:
-	for {
-		headtail := b.index.load()
-		head, tail = headtail.split()
-		if head >= tail {
-			// spanSet is nil
-			return nil
-		}
-		// 判断head还在数组里面 这里是再次检查，因为可能spine正在扩容？
-		spineLen := atomic.Loaduintptr(&b.spineLen)
-		if spineLen <= uintptr(head)/spanSetBlockEntries {
-			return nil
-		}
-		// cas修改index，修改成功就可以pop
-		want := head
-		for want == head {
-			if b.index.cas(headtail, makeHeadTailIndex(want+1, tail)) {
-				break claimLoop
-			}
-			headtail = b.index.load()
-			head, tail = headtail.split()
-		}
-	}
-	top, bottom := head/spanSetBlockEntries, head%spanSetBlockEntries
+    for {
+        headtail := b.index.load()
+        head, tail = headtail.split()
+        if head >= tail {
+            // spanSet is nil
+            return nil
+        }
+        // 判断head还在数组里面 这里是再次检查，因为可能spine正在扩容？
+        spineLen := atomic.Loaduintptr(&b.spineLen)
+        if spineLen <= uintptr(head)/spanSetBlockEntries {
+            return nil
+        }
+        // cas修改index，修改成功就可以pop
+        want := head
+        for want == head {
+            if b.index.cas(headtail, makeHeadTailIndex(want+1, tail)) {
+                break claimLoop
+            }
+            headtail = b.index.load()
+            head, tail = headtail.split()
+        }
+    }
+    top, bottom := head/spanSetBlockEntries, head%spanSetBlockEntries
 
-	// 拿到第几个spanSetBlock 和 对应其中的位置
-	spine := atomic.Loadp(unsafe.Pointer(&b.spine))
-	blockp := add(spine, sys.PtrSize*uintptr(top))
+    // 拿到第几个spanSetBlock 和 对应其中的位置
+    spine := atomic.Loadp(unsafe.Pointer(&b.spine))
+    blockp := add(spine, sys.PtrSize*uintptr(top))
 
-	// 取出block
-	block := (*spanSetBlock)(atomic.Loadp(blockp))
-	s := (*mspan)(atomic.Loadp(unsafe.Pointer(&block.spans[bottom])))
-	for s == nil {
-		// 再次尝试 竞争？
-		s = (*mspan)(atomic.Loadp(unsafe.Pointer(&block.spans[bottom])))
-	}
-	// 取出后的位置赋值为nil
-	atomic.StorepNoWB(unsafe.Pointer(&block.spans[bottom]), nil)
+    // 取出block
+    block := (*spanSetBlock)(atomic.Loadp(blockp))
+    s := (*mspan)(atomic.Loadp(unsafe.Pointer(&block.spans[bottom])))
+    for s == nil {
+        // 再次尝试 竞争？
+        s = (*mspan)(atomic.Loadp(unsafe.Pointer(&block.spans[bottom])))
+    }
+    // 取出后的位置赋值为nil
+    atomic.StorepNoWB(unsafe.Pointer(&block.spans[bottom]), nil)
     // spanSetBlock 被pop了512次，说明已经没有数据了，清空
-	if atomic.Xadd(&block.popped, 1) == spanSetBlockEntries {
-		// Clear the block's pointer.
-		atomic.StorepNoWB(blockp, nil)
+    if atomic.Xadd(&block.popped, 1) == spanSetBlockEntries {
+        // Clear the block's pointer.
+        atomic.StorepNoWB(blockp, nil)
 
-		// Return the block to the block pool.
-		spanSetBlockPool.free(block)
-	}
-	return s
+        // Return the block to the block pool.
+        spanSetBlockPool.free(block)
+    }
+    return s
 }
 ```
-从这两个函数可以看出，`spanSet` 被分为一个个块，每一个块存储512个 `mspan`，其本质上是一个支持并发的无锁队列，从头取，从尾存。
+从这两个函数可以看出，`spanSet` 被分为一个个块，每一个块存储512个 `mspan`（一页），其本质上是一个支持并发的无锁队列，从头取，从尾存。
 
 ## mheap
 ```
 type mheap struct {
-	// lock must only be acquired on the system stack, otherwise a g
-	// could self-deadlock if its stack grows with the lock held.
-	lock      mutex
-	pages     pageAlloc // page allocation data structure
-	sweepgen  uint32    // 清扫的代
-	sweepdone uint32    // all spans are swept
-	sweepers  uint32    // number of active sweepone calls
+    // lock must only be acquired on the system stack, otherwise a g
+    // could self-deadlock if its stack grows with the lock held.
+    lock      mutex
+    pages     pageAlloc // page allocation data structure
+    sweepgen  uint32    // 清扫的代
+    sweepdone uint32    // all spans are swept
+    sweepers  uint32    // number of active sweepone calls
 
-	// allspans is a slice of all mspans ever created. Each mspan
-	// appears exactly once.
-	//
-	// The memory for allspans is manually managed and can be
-	// reallocated and move as the heap grows.
-	//
-	// In general, allspans is protected by mheap_.lock, which
-	// prevents concurrent access as well as freeing the backing
-	// store. Accesses during STW might not hold the lock, but
-	// must ensure that allocation cannot happen around the
-	// access (since that may free the backing store).
-	allspans []*mspan // all spans out there
+    // allspans is a slice of all mspans ever created. Each mspan
+    // appears exactly once.
+    //
+    // The memory for allspans is manually managed and can be
+    // reallocated and move as the heap grows.
+    //
+    // In general, allspans is protected by mheap_.lock, which
+    // prevents concurrent access as well as freeing the backing
+    // store. Accesses during STW might not hold the lock, but
+    // must ensure that allocation cannot happen around the
+    // access (since that may free the backing store).
+    allspans []*mspan // all spans out there
 
-	_ uint32 // align uint64 fields on 32-bit for atomics
+    _ uint32 // align uint64 fields on 32-bit for atomics
 
-	// Proportional sweep
-	//
-	// These parameters represent a linear function from heap_live
-	// to page sweep count. The proportional sweep system works to
-	// stay in the black by keeping the current page sweep count
-	// above this line at the current heap_live.
-	//
-	// The line has slope sweepPagesPerByte and passes through a
-	// basis point at (sweepHeapLiveBasis, pagesSweptBasis). At
-	// any given time, the system is at (memstats.heap_live,
-	// pagesSwept) in this space.
-	//
-	// It's important that the line pass through a point we
-	// control rather than simply starting at a (0,0) origin
-	// because that lets us adjust sweep pacing at any time while
-	// accounting for current progress. If we could only adjust
-	// the slope, it would create a discontinuity in debt if any
-	// progress has already been made.
-	pagesInUse         uint64  // pages of spans in stats mSpanInUse; updated atomically
-	pagesSwept         uint64  // pages swept this cycle; updated atomically
-	pagesSweptBasis    uint64  // pagesSwept to use as the origin of the sweep ratio; updated atomically
-	sweepHeapLiveBasis uint64  // value of heap_live to use as the origin of sweep ratio; written with lock, read without
-	sweepPagesPerByte  float64 // proportional sweep ratio; written with lock, read without
-	// TODO(austin): pagesInUse should be a uintptr, but the 386
-	// compiler can't 8-byte align fields.
+    // Proportional sweep
+    //
+    // These parameters represent a linear function from heap_live
+    // to page sweep count. The proportional sweep system works to
+    // stay in the black by keeping the current page sweep count
+    // above this line at the current heap_live.
+    //
+    // The line has slope sweepPagesPerByte and passes through a
+    // basis point at (sweepHeapLiveBasis, pagesSweptBasis). At
+    // any given time, the system is at (memstats.heap_live,
+    // pagesSwept) in this space.
+    //
+    // It's important that the line pass through a point we
+    // control rather than simply starting at a (0,0) origin
+    // because that lets us adjust sweep pacing at any time while
+    // accounting for current progress. If we could only adjust
+    // the slope, it would create a discontinuity in debt if any
+    // progress has already been made.
+    pagesInUse         uint64  // pages of spans in stats mSpanInUse; updated atomically
+    pagesSwept         uint64  // pages swept this cycle; updated atomically
+    pagesSweptBasis    uint64  // pagesSwept to use as the origin of the sweep ratio; updated atomically
+    sweepHeapLiveBasis uint64  // value of heap_live to use as the origin of sweep ratio; written with lock, read without
+    sweepPagesPerByte  float64 // proportional sweep ratio; written with lock, read without
+    // TODO(austin): pagesInUse should be a uintptr, but the 386
+    // compiler can't 8-byte align fields.
 
-	// scavengeGoal is the amount of total retained heap memory (measured by
-	// heapRetained) that the runtime will try to maintain by returning memory
-	// to the OS.
-	scavengeGoal uint64
+    // scavengeGoal is the amount of total retained heap memory (measured by
+    // heapRetained) that the runtime will try to maintain by returning memory
+    // to the OS.
+    scavengeGoal uint64
 
-	// Page reclaimer state
+    // Page reclaimer state
 
-	// reclaimIndex is the page index in allArenas of next page to
-	// reclaim. Specifically, it refers to page (i %
-	// pagesPerArena) of arena allArenas[i / pagesPerArena].
-	//
-	// If this is >= 1<<63, the page reclaimer is done scanning
-	// the page marks.
-	//
-	// This is accessed atomically.
-	reclaimIndex uint64
-	// reclaimCredit is spare credit for extra pages swept. Since
-	// the page reclaimer works in large chunks, it may reclaim
-	// more than requested. Any spare pages released go to this
-	// credit pool.
-	//
-	// This is accessed atomically.
-	reclaimCredit uintptr
+    // reclaimIndex is the page index in allArenas of next page to
+    // reclaim. Specifically, it refers to page (i %
+    // pagesPerArena) of arena allArenas[i / pagesPerArena].
+    //
+    // If this is >= 1<<63, the page reclaimer is done scanning
+    // the page marks.
+    //
+    // This is accessed atomically.
+    reclaimIndex uint64
+    // reclaimCredit is spare credit for extra pages swept. Since
+    // the page reclaimer works in large chunks, it may reclaim
+    // more than requested. Any spare pages released go to this
+    // credit pool.
+    //
+    // This is accessed atomically.
+    reclaimCredit uintptr
 
-	// 所有的arenas
-	arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena
+    // 所有的arenas
+    arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena
 
-	// 64位未使用
-	heapArenaAlloc linearAlloc
+    // 64位未使用
+    heapArenaAlloc linearAlloc
 
-	// 向操作系统申请内存的时候的起始地址
-	arenaHints *arenaHint
+    // 向操作系统申请内存的时候的起始地址
+    arenaHints *arenaHint
 
-	// 64位未使用
-	arena linearAlloc
+    // 64位未使用
+    arena linearAlloc
 
-	// allArenas is the arenaIndex of every mapped arena. This can
-	// be used to iterate through the address space.
-	//
-	// Access is protected by mheap_.lock. However, since this is
-	// append-only and old backing arrays are never freed, it is
-	// safe to acquire mheap_.lock, copy the slice header, and
-	// then release mheap_.lock.
-	allArenas []arenaIdx
+    // allArenas is the arenaIndex of every mapped arena. This can
+    // be used to iterate through the address space.
+    //
+    // Access is protected by mheap_.lock. However, since this is
+    // append-only and old backing arrays are never freed, it is
+    // safe to acquire mheap_.lock, copy the slice header, and
+    // then release mheap_.lock.
+    allArenas []arenaIdx
 
-	// sweepArenas is a snapshot of allArenas taken at the
-	// beginning of the sweep cycle. This can be read safely by
-	// simply blocking GC (by disabling preemption).
-	sweepArenas []arenaIdx
+    // sweepArenas is a snapshot of allArenas taken at the
+    // beginning of the sweep cycle. This can be read safely by
+    // simply blocking GC (by disabling preemption).
+    sweepArenas []arenaIdx
 
-	// markArenas is a snapshot of allArenas taken at the beginning
-	// of the mark cycle. Because allArenas is append-only, neither
-	// this slice nor its contents will change during the mark, so
-	// it can be read safely.
-	markArenas []arenaIdx
+    // markArenas is a snapshot of allArenas taken at the beginning
+    // of the mark cycle. Because allArenas is append-only, neither
+    // this slice nor its contents will change during the mark, so
+    // it can be read safely.
+    markArenas []arenaIdx
 
-	// curArena is the arena that the heap is currently growing
-	// into. This should always be physPageSize-aligned.
-	curArena struct {
-		base, end uintptr
-	}
+    // curArena is the arena that the heap is currently growing
+    // into. This should always be physPageSize-aligned.
+    curArena struct {
+        base, end uintptr
+    }
 
-	_ uint32 // ensure 64-bit alignment of central
+    _ uint32 // ensure 64-bit alignment of central
 
-	// mcentral通过 spanclass管理
-	central [numSpanClasses]struct {
-		mcentral mcentral
-		pad      [cpu.CacheLinePadSize - unsafe.Sizeof(mcentral{})%cpu.CacheLinePadSize]byte
-	}
+    // mcentral通过 spanclass管理
+    central [numSpanClasses]struct {
+        mcentral mcentral
+        pad      [cpu.CacheLinePadSize - unsafe.Sizeof(mcentral{})%cpu.CacheLinePadSize]byte
+    }
 
     // 以下是各种分配器，缓存了mspan mcache等对象，进行内存复用
-	spanalloc             fixalloc // allocator for span*
-	cachealloc            fixalloc // allocator for mcache*
-	specialfinalizeralloc fixalloc // allocator for specialfinalizer*
-	specialprofilealloc   fixalloc // allocator for specialprofile*
-	speciallock           mutex    // lock for special record allocators.
-	arenaHintAlloc        fixalloc // allocator for arenaHints
+    spanalloc             fixalloc // allocator for span*
+    cachealloc            fixalloc // allocator for mcache*
+    specialfinalizeralloc fixalloc // allocator for specialfinalizer*
+    specialprofilealloc   fixalloc // allocator for specialprofile*
+    speciallock           mutex    // lock for special record allocators.
+    arenaHintAlloc        fixalloc // allocator for arenaHints
 
-	unused *specialfinalizer // never set, just here to force the specialfinalizer type into DWARF
+    unused *specialfinalizer // never set, just here to force the specialfinalizer type into DWARF
 }
 ```
 `mheap` 是全局变量，管理进程生命周期中的所有内存  
+当 `mcentral` 中没有可用 `span` 的时候，会去 `mheap` 中申请内存：
 ```
 // mheap 分配span
 func (h *mheap) allocSpan(npages uintptr, typ spanAllocType, spanclass spanClass) (s *mspan) {
-	// Function-global state.
-	gp := getg()
-	base, scav := uintptr(0), uintptr(0)
+    // Function-global state.
+    gp := getg()
+    base, scav := uintptr(0), uintptr(0)
 
-	// 有些系统在分配栈的内存的时候需要跟物理页对齐
-	needPhysPageAlign := physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize
+    // 有些系统在分配栈的内存的时候需要跟物理页对齐
+    needPhysPageAlign := physPageAlignedStacks && typ == spanAllocStack && pageSize < physPageSize
 
-	// 不需要跟物理页面对齐的 并且小于128k 尝试使用P的pageCache来分配
-	pp := gp.m.p.ptr()
-	if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
-		c := &pp.pcache
+    // 不需要跟物理页面对齐的 并且小于128k 尝试使用P的pageCache来分配
+    pp := gp.m.p.ptr()
+    if !needPhysPageAlign && pp != nil && npages < pageCachePages/4 {
+        c := &pp.pcache
 
-		// 缓存为空，分配一个
-		if c.empty() {
-			lock(&h.lock)
-			*c = h.pages.allocToCache()
-			unlock(&h.lock)
-		}
+        // 缓存为空，分配一个
+        if c.empty() {
+            lock(&h.lock)
+            *c = h.pages.allocToCache()
+            unlock(&h.lock)
+        }
 
-		// 从P的pageCache中分配一些页
-		base, scav = c.alloc(npages)
-		if base != 0 {
+        // 从P的pageCache中分配一些页
+        base, scav = c.alloc(npages)
+        if base != 0 {
             // 从mspan的缓存中取一个mspan对象（上面是分配内存，这里仅仅是分配一个mspan对象的内存）
-			s = h.tryAllocMSpan()
-			if s != nil {
-				goto HaveSpan
-			}
-		}
-	}
+            s = h.tryAllocMSpan()
+            if s != nil {
+                goto HaveSpan
+            }
+        }
+    }
 
-	lock(&h.lock)
+    lock(&h.lock)
 
-	if needPhysPageAlign {
-		// Overallocate by a physical page to allow for later alignment.
-		npages += physPageSize / pageSize
-	}
+    if needPhysPageAlign {
+        // Overallocate by a physical page to allow for later alignment.
+        npages += physPageSize / pageSize
+    }
 
-	if base == 0 {
-		// P中的PageCache没有内存，从全局的页里面分配内存
-		base, scav = h.pages.alloc(npages)
-		if base == 0 {
+    if base == 0 {
+        // P中的PageCache没有内存，从全局的页里面分配内存
+        base, scav = h.pages.alloc(npages)
+        if base == 0 {
             // 内存不够，runtime去系统里面申请一些页
-			if !h.grow(npages) {
-				unlock(&h.lock)
-				return nil
-			}
+            if !h.grow(npages) {
+                unlock(&h.lock)
+                return nil
+            }
             // 分配span
-			base, scav = h.pages.alloc(npages)
-			if base == 0 {
-				throw("grew heap, but no adequate free space found")
-			}
-		}
-	}
-	if s == nil {
-		// 通过全局获取一个mspan对象
-		s = h.allocMSpanLocked()
-	}
+            base, scav = h.pages.alloc(npages)
+            if base == 0 {
+                throw("grew heap, but no adequate free space found")
+            }
+        }
+    }
+    if s == nil {
+        // 通过全局获取一个mspan对象
+        s = h.allocMSpanLocked()
+    }
 
-	if needPhysPageAlign {
-		allocBase, allocPages := base, npages
-		base = alignUp(allocBase, physPageSize)
-		npages -= physPageSize / pageSize
+    if needPhysPageAlign {
+        allocBase, allocPages := base, npages
+        base = alignUp(allocBase, physPageSize)
+        npages -= physPageSize / pageSize
 
-		// Return memory around the aligned allocation.
-		spaceBefore := base - allocBase
-		if spaceBefore > 0 {
-			h.pages.free(allocBase, spaceBefore/pageSize)
-		}
-		spaceAfter := (allocPages-npages)*pageSize - spaceBefore
-		if spaceAfter > 0 {
-			h.pages.free(base+npages*pageSize, spaceAfter/pageSize)
-		}
-	}
+        // Return memory around the aligned allocation.
+        spaceBefore := base - allocBase
+        if spaceBefore > 0 {
+            h.pages.free(allocBase, spaceBefore/pageSize)
+        }
+        spaceAfter := (allocPages-npages)*pageSize - spaceBefore
+        if spaceAfter > 0 {
+            h.pages.free(base+npages*pageSize, spaceAfter/pageSize)
+        }
+    }
 
-	unlock(&h.lock)
+    unlock(&h.lock)
 
 HaveSpan:
-	// 以下是初始化mspan
-	s.init(base, npages)
-	if h.allocNeedsZero(base, npages) {
-		s.needzero = 1
-	}
-	nbytes := npages * pageSize
-	if typ.manual() {
+    // 以下是初始化mspan
+    s.init(base, npages)
+    if h.allocNeedsZero(base, npages) {
+        s.needzero = 1
+    }
+    nbytes := npages * pageSize
+    if typ.manual() {
         // 非 堆类型 内存的初始化
-		s.manualFreeList = 0
-		s.nelems = 0
-		s.limit = s.base() + s.npages*pageSize
-		s.state.set(mSpanManual)
-	} else {
-		// 设置spanClass
-		s.spanclass = spanclass
-		if sizeclass := spanclass.sizeclass(); sizeclass == 0 {
+        s.manualFreeList = 0
+        s.nelems = 0
+        s.limit = s.base() + s.npages*pageSize
+        s.state.set(mSpanManual)
+    } else {
+        // 设置spanClass
+        s.spanclass = spanclass
+        if sizeclass := spanclass.sizeclass(); sizeclass == 0 {
             // 特殊处理 sizeclass = 0 TODO：好像没有看到用sizeclass为0的
-			s.elemsize = nbytes
-			s.nelems = 1
+            s.elemsize = nbytes
+            s.nelems = 1
 
-			s.divShift = 0
-			s.divMul = 0
-			s.divShift2 = 0
-			s.baseMask = 0
-		} else {
+            s.divShift = 0
+            s.divMul = 0
+            s.divShift2 = 0
+            s.baseMask = 0
+        } else {
             // 根据对象大小预定义属性
-			s.elemsize = uintptr(class_to_size[sizeclass])
-			s.nelems = nbytes / s.elemsize
+            s.elemsize = uintptr(class_to_size[sizeclass])
+            s.nelems = nbytes / s.elemsize
 
-			m := &class_to_divmagic[sizeclass]
-			s.divShift = m.shift
-			s.divMul = m.mul
-			s.divShift2 = m.shift2
-			s.baseMask = m.baseMask
-		}
+            m := &class_to_divmagic[sizeclass]
+            s.divShift = m.shift
+            s.divMul = m.mul
+            s.divShift2 = m.shift2
+            s.baseMask = m.baseMask
+        }
 
-		// 初始化内存标记相关属性
-		s.freeindex = 0
-		s.allocCache = ^uint64(0) // all 1s indicating all free.
-		s.gcmarkBits = newMarkBits(s.nelems)
-		s.allocBits = newAllocBits(s.nelems)
+        // 初始化内存标记相关属性
+        s.freeindex = 0
+        s.allocCache = ^uint64(0) // all 1s indicating all free.
+        s.gcmarkBits = newMarkBits(s.nelems)
+        s.allocBits = newAllocBits(s.nelems)
 
-		// 更新sweepgen
-		atomic.Store(&s.sweepgen, h.sweepgen)
+        // 更新sweepgen
+        atomic.Store(&s.sweepgen, h.sweepgen)
 
-		// 修改span状态 防止gc的时候扫描到的无效指针指向此span导致的竞争
+        // 修改span状态 防止gc的时候扫描到的无效指针指向此span导致的竞争
         // 这样在任何需要的场景下进行判断状态来避免并发竞争
-		s.state.set(mSpanInUse)
-	}
+        s.state.set(mSpanInUse)
+    }
 
-	if scav != 0 {
-		// sysUsed
-		sysUsed(unsafe.Pointer(base), nbytes)
-		atomic.Xadd64(&memstats.heap_released, -int64(scav))
-	}
-	// Update stats.
-	if typ == spanAllocHeap {
-		atomic.Xadd64(&memstats.heap_inuse, int64(nbytes))
-	}
-	if typ.manual() {
-		// Manually managed memory doesn't count toward heap_sys.
-		memstats.heap_sys.add(-int64(nbytes))
-	}
-	// Update consistent stats.
-	stats := memstats.heapStats.acquire()
-	atomic.Xaddint64(&stats.committed, int64(scav))
-	atomic.Xaddint64(&stats.released, -int64(scav))
-	switch typ {
-	case spanAllocHeap:
-		atomic.Xaddint64(&stats.inHeap, int64(nbytes))
-	case spanAllocStack:
-		atomic.Xaddint64(&stats.inStacks, int64(nbytes))
-	case spanAllocPtrScalarBits:
-		atomic.Xaddint64(&stats.inPtrScalarBits, int64(nbytes))
-	case spanAllocWorkBuf:
-		atomic.Xaddint64(&stats.inWorkBufs, int64(nbytes))
-	}
-	memstats.heapStats.release()
+    if scav != 0 {
+        // sysUsed
+        sysUsed(unsafe.Pointer(base), nbytes)
+        atomic.Xadd64(&memstats.heap_released, -int64(scav))
+    }
+    // Update stats.
+    if typ == spanAllocHeap {
+        atomic.Xadd64(&memstats.heap_inuse, int64(nbytes))
+    }
+    if typ.manual() {
+        // Manually managed memory doesn't count toward heap_sys.
+        memstats.heap_sys.add(-int64(nbytes))
+    }
+    // Update consistent stats.
+    stats := memstats.heapStats.acquire()
+    atomic.Xaddint64(&stats.committed, int64(scav))
+    atomic.Xaddint64(&stats.released, -int64(scav))
+    switch typ {
+    case spanAllocHeap:
+        atomic.Xaddint64(&stats.inHeap, int64(nbytes))
+    case spanAllocStack:
+        atomic.Xaddint64(&stats.inStacks, int64(nbytes))
+    case spanAllocPtrScalarBits:
+        atomic.Xaddint64(&stats.inPtrScalarBits, int64(nbytes))
+    case spanAllocWorkBuf:
+        atomic.Xaddint64(&stats.inWorkBufs, int64(nbytes))
+    }
+    memstats.heapStats.release()
 
-	// Publish the span in various locations.
+    // Publish the span in various locations.
 
-	// span存到mheap的arena
-	h.setSpans(s.base(), npages, s)
+    // span存到mheap的arena
+    h.setSpans(s.base(), npages, s)
 
-	if !typ.manual() {
-		// 将span的标记信息加入到arena
-		arena, pageIdx, pageMask := pageIndexOf(s.base())
-		atomic.Or8(&arena.pageInUse[pageIdx], pageMask)
+    if !typ.manual() {
+        // 将span的标记信息加入到arena
+        arena, pageIdx, pageMask := pageIndexOf(s.base())
+        atomic.Or8(&arena.pageInUse[pageIdx], pageMask)
 
-		// Update related page sweeper stats.
-		atomic.Xadd64(&h.pagesInUse, int64(npages))
-	}
+        // Update related page sweeper stats.
+        atomic.Xadd64(&h.pagesInUse, int64(npages))
+    }
 
-	// Make sure the newly allocated span will be observed
-	// by the GC before pointers into the span are published.
-	publicationBarrier()
+    // Make sure the newly allocated span will be observed
+    // by the GC before pointers into the span are published.
+    publicationBarrier()
 
-	return s
+    return s
 }
 ```
-到此上一个主角 `mspan` 以及相关数据结构基本明白了，而 `mspan` 的来源也清晰了，是通过 `page` 来组成的，那么 `page` 是如何来的，以及是如何管理的。  
-**因为硬件和操作系统限制，linux amd64 分配最大内存为 1<<48，golang将内存分为一个个arena，每一个大小为64M（1<<26），因此总共可以有1<<22个arena，每一个arena具有8192个页（8192*8k=64M），然后通过字典树来映射arenas**
 
+*******************************************************************
+**因为硬件和操作系统限制，linux amd64 分配最大内存为 1<<48，golang将内存分为一个个arena，每一个大小为64M（1<<26），因此总共可以有1<<22个arena，每一个arena具有8192个页（8192*8k=64M），然后通过字典树来映射arenas中的内存**  
 `mheap`是以页为基本单位来管理内存的，最上面一层是 `arena`，数据结构是以下定义：
 ```
 type heapArena struct {
-	// 当前heapArena的位图表示 2M
-	bitmap [heapArenaBitmapBytes]byte
+    // 当前heapArena的位图表示 2M
+    bitmap [heapArenaBitmapBytes]byte
 
-	// 这里的mspan每一个都是存了一个页，是为了管理页，与上面的不同
+    // 这里的mspan每一个都是存了一个页，是为了管理页，与上面的不同
     // pagesPerArena = 8192 因此一个heapArena管理的内存大小是8192*8192 = 64M
-	spans [pagesPerArena]*mspan
+    spans [pagesPerArena]*mspan
 
-	// 表示哪个页在使用，每一位表示一个页
-	pageInUse [pagesPerArena / 8]uint8
+    // 表示哪个页在使用，每一位表示一个页
+    pageInUse [pagesPerArena / 8]uint8
 
-	// 表示哪个页上面有对象被标记
-	pageMarks [pagesPerArena / 8]uint8
+    // 表示哪个页上面有对象被标记
+    pageMarks [pagesPerArena / 8]uint8
 
-	// pageSpecials is a bitmap that indicates which spans have
-	// specials (finalizers or other).
-	pageSpecials [pagesPerArena / 8]uint8
+    // pageSpecials is a bitmap that indicates which spans have
+    // specials (finalizers or other).
+    pageSpecials [pagesPerArena / 8]uint8
 
-	// debug模式调试使用
-	checkmarks *checkmarksMap
+    // debug模式调试使用
+    checkmarks *checkmarksMap
 
-	// zeroedBase marks the first byte of the first page in this
-	// arena which hasn't been used yet and is therefore already
-	// zero. zeroedBase is relative to the arena base.
-	// Increases monotonically until it hits heapArenaBytes.
-	//
-	// This field is sufficient to determine if an allocation
-	// needs to be zeroed because the page allocator follows an
-	// address-ordered first-fit policy.
-	//
-	// Read atomically and written with an atomic CAS.
-	zeroedBase uintptr
+    // zeroedBase marks the first byte of the first page in this
+    // arena which hasn't been used yet and is therefore already
+    // zero. zeroedBase is relative to the arena base.
+    // Increases monotonically until it hits heapArenaBytes.
+    //
+    // This field is sufficient to determine if an allocation
+    // needs to be zeroed because the page allocator follows an
+    // address-ordered first-fit policy.
+    //
+    // Read atomically and written with an atomic CAS.
+    zeroedBase uintptr
 }
 ```
+*******************************************************************
 
-
+当 `mheap` 中的内存不够的时候，会去操作系统申请内存，以下函数是申请内存和管理申请操作系统内存的元数据信息：
 ```
 func (h *mheap) grow(npage uintptr) bool {
-	assertLockHeld(&h.lock)
+    assertLockHeld(&h.lock)
 
-	// 申请512整数倍的页数，也就是最少4M
-	ask := alignUp(npage, pallocChunkPages) * pageSize
+    // 申请512整数倍的页数，也就是最少4M
+    ask := alignUp(npage, pallocChunkPages) * pageSize
 
-	totalGrowth := uintptr(0)
-	end := h.curArena.base + ask
-	nBase := alignUp(end, physPageSize)
-	if nBase > h.curArena.end || /* overflow */ end < h.curArena.base {
-        // 当前arena空间不够
-		av, asize := h.sysAlloc(ask)
-		if av == nil {
-			print("runtime: out of memory: cannot allocate ", ask, "-byte block (", memstats.heap_sys, " in use)\n")
-			return false
-		}
-        
-		if uintptr(av) == h.curArena.end {
-			// The new space is contiguous with the old
-			// space, so just extend the current space.
-			h.curArena.end = uintptr(av) + asize
-		} else {
-			// The new space is discontiguous. Track what
-			// remains of the current space and switch to
-			// the new space. This should be rare.
-			if size := h.curArena.end - h.curArena.base; size != 0 {
-				h.pages.grow(h.curArena.base, size)
-				totalGrowth += size
-			}
-			// Switch to the new space.
-			h.curArena.base = uintptr(av)
-			h.curArena.end = uintptr(av) + asize
-		}
+    totalGrowth := uintptr(0)
+    end := h.curArena.base + ask
+    nBase := alignUp(end, physPageSize)
+    if nBase > h.curArena.end || /* overflow */ end < h.curArena.base {
+        // 当前arena空间不够，去操作系统申请一块内存
+        av, asize := h.sysAlloc(ask)
+        if av == nil {
+            print("runtime: out of memory: cannot allocate ", ask, "-byte block (", memstats.heap_sys, " in use)\n")
+            return false
+        }
 
-		// The memory just allocated counts as both released
-		// and idle, even though it's not yet backed by spans.
-		//
-		// The allocation is always aligned to the heap arena
-		// size which is always > physPageSize, so its safe to
-		// just add directly to heap_released.
-		atomic.Xadd64(&memstats.heap_released, int64(asize))
-		stats := memstats.heapStats.acquire()
-		atomic.Xaddint64(&stats.released, int64(asize))
-		memstats.heapStats.release()
+        if uintptr(av) == h.curArena.end {
+            // 新申请的内存与上一段内存是连续的，扩大当前arena的边界
+            h.curArena.end = uintptr(av) + asize
+        } else {
+            // 不连续的话把上一块arena剩下的内存保留下来
+            if size := h.curArena.end - h.curArena.base; size != 0 {
+                h.pages.grow(h.curArena.base, size)
+                totalGrowth += size
+            }
+            // 更新当前arena的范围
+            h.curArena.base = uintptr(av)
+            h.curArena.end = uintptr(av) + asize
+        }
 
-		// Recalculate nBase.
-		// We know this won't overflow, because sysAlloc returned
-		// a valid region starting at h.curArena.base which is at
-		// least ask bytes in size.
-		nBase = alignUp(h.curArena.base+ask, physPageSize)
-	}
+        // 更新内存状态
+        atomic.Xadd64(&memstats.heap_released, int64(asize))
+        stats := memstats.heapStats.acquire()
+        atomic.Xaddint64(&stats.released, int64(asize))
+        memstats.heapStats.release()
 
-	// Grow into the current arena.
-	v := h.curArena.base
-	h.curArena.base = nBase
-	h.pages.grow(v, nBase-v)
-	totalGrowth += nBase - v
+        // 重新计算base
+        nBase = alignUp(h.curArena.base+ask, physPageSize)
+    }
 
-	// We just caused a heap growth, so scavenge down what will soon be used.
-	// By scavenging inline we deal with the failure to allocate out of
-	// memory fragments by scavenging the memory fragments that are least
-	// likely to be re-used.
-	if retained := heapRetained(); retained+uint64(totalGrowth) > h.scavengeGoal {
-		todo := totalGrowth
-		if overage := uintptr(retained + uint64(totalGrowth) - h.scavengeGoal); todo > overage {
-			todo = overage
-		}
-		h.pages.scavenge(todo, false)
-	}
-	return true
+    // 这里无论是否向操作系统申请内存，对当前arena的base进行更新
+    v := h.curArena.base
+    h.curArena.base = nBase
+    // 把申请到的内存放到pages中管理
+    h.pages.grow(v, nBase-v)
+    totalGrowth += nBase - v
+
+    // We just caused a heap growth, so scavenge down what will soon be used.
+    // By scavenging inline we deal with the failure to allocate out of
+    // memory fragments by scavenging the memory fragments that are least
+    // likely to be re-used.
+    if retained := heapRetained(); retained+uint64(totalGrowth) > h.scavengeGoal {
+        todo := totalGrowth
+        if overage := uintptr(retained + uint64(totalGrowth) - h.scavengeGoal); todo > overage {
+            todo = overage
+        }
+        h.pages.scavenge(todo, false)
+    }
+    return true
 }
 ```
+向操作系统申请内存：`go`对系统内存的使用经过以下几个函数封装，包装成几个阶段：
+1. `sysReserve` 函数 把一块内存地址从 `NONE` 的状态转换为预定状态，此时这块内存还不能用
+2. `sysMap` 函数 把一块为预定状态的内存转换为准备状态，可以确保内存被有效的转换为就绪状态
+3. `sysUsed` 函数 把准备状态的内存转换为就绪状态，此时我们就可以使用这块内存了
+4. `sysAlloc` 函数 可以直接把一块内存地址从 `NONE` 转换为就绪状态 （注意，不是 `mheap` 的 `sysAlloc` 方法）
+5. `sysUnused` 函数 与 `sysUsed` 刚好相反
+6. `sysFault` 只在debug模式下使用，暂不用管
+7. `sysFree` 将任何状态的内存转换为 `NONE`
+
+```
+func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
+    assertLockHeld(&h.lock)
+    // 一次申请最少64M内存，减少系统调用，分摊消耗
+    n = alignUp(n, heapArenaBytes)
+
+    // 这是32位用的 忽略
+    v = h.arena.alloc(n, heapArenaBytes, &memstats.heap_sys)
+    if v != nil {
+        size = n
+        goto mapped
+    }
+    // 忽略
+
+    // arenaHints这个东西是在go程序初始化的时候，将可以分配的最大内存1<<48 分成 128 个 1<<40 区域
+    // 也就是初始化的时候预先计算128T的空间大小，分为128个1T大小的地址空间，做为向系统申请内存的位置 参见malloc.go mallocinit()函数 487行
+    for h.arenaHints != nil {
+        hint := h.arenaHints
+        p := hint.addr
+        if hint.down {
+            // 当内存插入点不是我们预先计算好的128T的空间地址时
+            p -= n
+        }
+        if p+n < p {
+            // 溢出了
+            v = nil
+        } else if arenaIndex(p+n-1) >= 1<<arenaBits {
+            // 分配的地址超过了22个arena的大小
+            v = nil
+        } else {
+            // 可以分配，从p地址开始向系统要n字节的内存 做为预定
+            v = sysReserve(unsafe.Pointer(p), n)
+        }
+        if p == uintptr(v) {
+            // 成功预定了内存
+            if !hint.down {
+                p += n
+            }
+            // 更新当前1T的地址
+            hint.addr = p
+            size = n
+            break
+        }
+        // 预定内存失败了，预定的内存地址不是我们想要的内存地址
+        if v != nil {
+            // 释放
+            sysFree(v, n, nil)
+        }
+        // 用下一个计算好的1T空间的地址再次尝试分配
+        h.arenaHints = hint.next
+        h.arenaHintAlloc.free(unsafe.Pointer(hint))
+    }
+
+    if size == 0 {
+        // 最终我们预先计算好的128个1T空间地址没有预订成功的了
+        if raceenabled {
+            throw("too many address space collisions for -race mode")
+        }
+
+        // 向操作系统申请一块64M的内存，不指定想要的内存地址，让系统给我们分配
+        v, size = sysReserveAligned(nil, n, heapArenaBytes)
+        if v == nil {
+            return nil, 0
+        }
+
+        // 创建新的hint做为内存向系统申请内存的分配点
+        hint := (*arenaHint)(h.arenaHintAlloc.alloc())
+        // 不是我们预先计算好的了，内存地址是从高地址往低地址增长了
+        hint.addr, hint.down = uintptr(v), true
+        hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
+        hint = (*arenaHint)(h.arenaHintAlloc.alloc())
+        hint.addr = uintptr(v) + size
+        hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
+    }
+
+    // 这块代码对申请到的内存进行安全检查
+    {
+        var bad string
+        p := uintptr(v)
+        if p+size < p {
+            bad = "region exceeds uintptr range"
+        } else if arenaIndex(p) >= 1<<arenaBits {
+            bad = "base outside usable address space"
+        } else if arenaIndex(p+size-1) >= 1<<arenaBits {
+            bad = "end outside usable address space"
+        }
+        if bad != "" {
+            // This should be impossible on most architectures,
+            // but it would be really confusing to debug.
+            print("runtime: memory allocated by OS [", hex(p), ", ", hex(p+size), ") not in usable address space: ", bad, "\n")
+            throw("memory reservation exceeds address space limit")
+        }
+    }
+
+    if uintptr(v)&(heapArenaBytes-1) != 0 {
+        throw("misrounded allocation in sysAlloc")
+    }
+
+    // 将预定的内存转换为准备状态
+    sysMap(v, size, &memstats.heap_sys)
+
+mapped:
+    // 创建管理arena的元数据，获取我们申请的地址所在 1<<22 个 64M的arena的编号
+    for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
+        l2 := h.arenas[ri.l1()]
+        if l2 == nil {
+            // 如果这个L2的heaparena数组还没初始化，分配内存初始化
+            l2 = (*[1 << arenaL2Bits]*heapArena)(persistentalloc(unsafe.Sizeof(*l2), sys.PtrSize, nil))
+            if l2 == nil {
+                throw("out of memory allocating heap arena map")
+            }
+            // heaparena的地址存到mheap的arenas中
+            atomic.StorepNoWB(unsafe.Pointer(&h.arenas[ri.l1()]), unsafe.Pointer(l2))
+        }
+
+        // L2数组中对应的heaparena应该为空，不为空说明这块64M内存已经被我们申请过了
+        if l2[ri.l2()] != nil {
+            throw("arena already initialized")
+        }
+        // 分配heaparena数据结构的内存
+        var r *heapArena
+        r = (*heapArena)(h.heapArenaAlloc.alloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gcMiscSys))
+        if r == nil {
+            r = (*heapArena)(persistentalloc(unsafe.Sizeof(*r), sys.PtrSize, &memstats.gcMiscSys))
+            if r == nil {
+                throw("out of memory allocating heap arena metadata")
+            }
+        }
+
+        // 把新分配的arena放到allarenas中
+        if len(h.allArenas) == cap(h.allArenas) {
+            // 切片操作 扩容等
+            size := 2 * uintptr(cap(h.allArenas)) * sys.PtrSize
+            if size == 0 {
+                size = physPageSize
+            }
+            newArray := (*notInHeap)(persistentalloc(size, sys.PtrSize, &memstats.gcMiscSys))
+            if newArray == nil {
+                throw("out of memory allocating allArenas")
+            }
+            oldSlice := h.allArenas
+            *(*notInHeapSlice)(unsafe.Pointer(&h.allArenas)) = notInHeapSlice{newArray, len(h.allArenas), int(size / sys.PtrSize)}
+            copy(h.allArenas, oldSlice)
+        }
+        h.allArenas = h.allArenas[:len(h.allArenas)+1]
+        h.allArenas[len(h.allArenas)-1] = ri
+
+        // 把arena放入对应的arenas的数组中
+        atomic.StorepNoWB(unsafe.Pointer(&l2[ri.l2()]), unsafe.Pointer(r))
+    }
+
+    // Tell the race detector about the new heap memory.
+    if raceenabled {
+        racemapshadow(v, size)
+    }
+
+    return
+}
+```
+从上面函数可以看到，向操作系统申请内存的时候，最少申请64M内存，并且生成 `heapArena`来管理新申请的内存，并存入 `mheap` 中的 `arenas` 中，将对应的 `arena`编号存入 `allArenas` 中。内存申请成功后，会将申请到的内存放到 `mheap` 的 `pageAlloc` 来进行管理，`mcentral` 需要的 `mspan` 所需要的内存就是通过 `pageAlloc` 来进行分配。
+
+## pageAlloc
+TODO
